@@ -5,12 +5,12 @@ use super::*;
 pub enum SnafuError {
   #[snafu(display("Failed to parse address `{}`", input))]
   AddressParse {
-    source: bitcoin::address::Error,
+    source: bitcoin::address::error::ParseError,
     input: String,
   },
   #[snafu(display("Failed to parse hash `{}`", input))]
   HashParse {
-    source: bitcoin::hashes::hex::Error,
+    source: bitcoin::hex::HexToArrayError,
     input: String,
   },
   #[snafu(display("Failed to parse inscription ID `{}`", input))]
@@ -43,8 +43,23 @@ pub enum SnafuError {
     source: ordinals::sat_point::Error,
     input: String,
   },
-  #[snafu(display("Unrecognized representation `{}`", input))]
-  UnrecognizedRepresentation { source: error::Error, input: String },
+  #[snafu(display("Unrecognized representation: `{}`", input))]
+  UnrecognizedRepresentation { input: String },
+  #[snafu(display("Unrecognized outgoing amount: `{}`", input))]
+  AmountParse {
+    source: <Amount as FromStr>::Err,
+    input: String,
+  },
+  #[snafu(display("Unrecognized outgoing: `{}`", input))]
+  OutgoingParse { input: String },
+  #[snafu(display("Failed to parse decimal: {}", source))]
+  RuneAmountParse { source: error::Error, input: String },
+  #[snafu(display("Invalid chain `{}`", chain))]
+  InvalidChain { chain: String },
+  #[snafu(display("Failed to convert script to address: {}", source))]
+  AddressConversion {
+    source: bitcoin::address::FromScriptError,
+  },
   #[snafu(display("{err}"))]
   Anyhow { err: anyhow::Error },
   #[snafu(display("environment variable `{variable}` not valid unicode: `{}`", value.to_string_lossy()))]
@@ -59,6 +74,8 @@ pub enum SnafuError {
     path: PathBuf,
     source: io::Error,
   },
+  #[snafu(display("Unrecognized signer: `{}`", input))]
+  SignerParse { input: String },
 }
 
 impl From<Error> for SnafuError {
@@ -70,7 +87,7 @@ impl From<Error> for SnafuError {
 /// We currently use `anyhow` for error handling but are migrating to typed
 /// errors using `snafu`. This trait exists to provide access to
 /// `snafu::ResultExt::{context, with_context}`, which are otherwise shadowed
-/// by `anhow::Context::{context, with_context}`. Once the migration is
+/// by `anyhow::Context::{context, with_context}`. Once the migration is
 /// complete, this trait can be deleted, and `snafu::ResultExt` used directly.
 pub(crate) trait ResultExt<T, E>: Sized {
   fn snafu_context<C, E2>(self, context: C) -> Result<T, E2>

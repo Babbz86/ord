@@ -38,7 +38,7 @@ pub(crate) struct Spawn {
 
 impl Spawn {
   #[track_caller]
-  fn run(self) -> (TempDir, String) {
+  fn run(self) -> (Arc<TempDir>, String) {
     let output = self.child.wait_with_output().unwrap();
 
     let stdout = str::from_utf8(&output.stdout).unwrap();
@@ -53,7 +53,7 @@ impl Spawn {
     self.expected_stderr.assert_match(stderr);
     self.expected_stdout.assert_match(stdout);
 
-    (Arc::try_unwrap(self.tempdir).unwrap(), stdout.into())
+    (self.tempdir, stdout.into())
   }
 
   #[track_caller]
@@ -190,7 +190,7 @@ impl CommandBuilder {
   }
 
   pub(crate) fn command(&self) -> Command {
-    let mut command = Command::new(executable_path("ord"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ord"));
 
     if let Some(rpc_server_url) = &self.core_url {
       command.args([
@@ -205,11 +205,11 @@ impl CommandBuilder {
 
     for arg in self.args.iter() {
       args.push(arg.clone());
-      if arg == "wallet" {
-        if let Some(ord_server_url) = &self.ord_url {
-          args.push("--server-url".to_string());
-          args.push(ord_server_url.to_string());
-        }
+      if arg == "wallet"
+        && let Some(ord_server_url) = &self.ord_url
+      {
+        args.push("--server-url".to_string());
+        args.push(ord_server_url.to_string());
       }
     }
 
@@ -263,7 +263,7 @@ impl CommandBuilder {
   }
 
   #[track_caller]
-  fn run(self) -> (TempDir, String) {
+  pub(crate) fn run(self) -> (Arc<TempDir>, String) {
     self.spawn().run()
   }
 

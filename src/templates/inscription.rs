@@ -1,34 +1,86 @@
 use super::*;
 
 #[derive(Boilerplate, Default)]
-pub(crate) struct InscriptionHtml {
-  pub(crate) chain: Chain,
-  pub(crate) charms: u16,
-  pub(crate) children: Vec<InscriptionId>,
-  pub(crate) fee: u64,
-  pub(crate) height: u32,
-  pub(crate) inscription: Inscription,
-  pub(crate) id: InscriptionId,
-  pub(crate) number: i32,
-  pub(crate) next: Option<InscriptionId>,
-  pub(crate) output: Option<TxOut>,
-  pub(crate) parents: Vec<InscriptionId>,
-  pub(crate) previous: Option<InscriptionId>,
-  pub(crate) rune: Option<SpacedRune>,
-  pub(crate) sat: Option<Sat>,
-  pub(crate) satpoint: SatPoint,
-  pub(crate) timestamp: DateTime<Utc>,
+pub struct InscriptionHtml {
+  pub chain: Chain,
+  pub charms: u16,
+  pub child_count: u64,
+  pub children: Vec<InscriptionId>,
+  pub fee: u64,
+  pub height: u32,
+  pub id: InscriptionId,
+  pub inscription: Inscription,
+  pub next: Option<InscriptionId>,
+  pub number: i32,
+  pub output: Option<TxOut>,
+  pub parents: Vec<InscriptionId>,
+  pub previous: Option<InscriptionId>,
+  pub properties: Properties,
+  pub rune: Option<SpacedRune>,
+  pub sat: Option<Sat>,
+  pub satpoint: SatPoint,
+  pub timestamp: DateTime<Utc>,
 }
 
 impl PageContent for InscriptionHtml {
+  fn og_image_path(&self) -> Option<String> {
+    const SUPPORTED: &[&str] = &["image/gif", "image/jpeg", "image/png", "image/webp"];
+
+    if SUPPORTED.contains(&self.inscription.content_type()?) {
+      Some(format!("/content/{}", self.id))
+    } else {
+      None
+    }
+  }
+
   fn title(&self) -> String {
     format!("Inscription {}", self.number)
+  }
+}
+
+impl InscriptionHtml {
+  pub fn burn_metadata(&self) -> Option<Value> {
+    let script_pubkey = &self.output.as_ref()?.script_pubkey;
+
+    if !script_pubkey.is_op_return() {
+      return None;
+    }
+
+    let script::Instruction::PushBytes(metadata) = script_pubkey.instructions().nth(1)?.ok()?
+    else {
+      return None;
+    };
+
+    ciborium::from_reader(Cursor::new(metadata)).ok()
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn og_image_path_only_set_for_supported_image_types() {
+    #[track_caller]
+    fn case(content_type: &str, supported: bool) {
+      assert_eq!(
+        InscriptionHtml {
+          inscription: inscription(content_type, "foo"),
+          id: inscription_id(1),
+          ..default()
+        }
+        .og_image_path(),
+        supported.then(|| format!("/content/{}", inscription_id(1))),
+      );
+    }
+
+    case("image/gif", true);
+    case("image/jpeg", true);
+    case("image/png", true);
+    case("image/webp", true);
+
+    case("image/avif", false);
+  }
 
   #[test]
   fn without_sat_nav_links_or_output() {
@@ -50,7 +102,7 @@ mod tests {
         </div>
         <dl>
           <dt>id</dt>
-          <dd class=monospace>1{64}i1</dd>
+          <dd class=collapse>1{64}i1</dd>
           <dt>preview</dt>
           <dd><a href=/preview/1{64}i1>link</a></dd>
           <dt>content</dt>
@@ -66,15 +118,15 @@ mod tests {
           <dt>fee</dt>
           <dd>1</dd>
           <dt>reveal transaction</dt>
-          <dd><a class=monospace href=/tx/1{64}>1{64}</a></dd>
+          <dd><a class=collapse href=/tx/1{64}>1{64}</a></dd>
           <dt>location</dt>
-          <dd class=monospace>1{64}:1:0</dd>
+          <dd><a class=collapse href=/satpoint/1{64}:1:0>1{64}:1:0</a></dd>
           <dt>output</dt>
-          <dd><a class=monospace href=/output/1{64}:1>1{64}:1</a></dd>
+          <dd><a class=collapse href=/output/1{64}:1>1{64}:1</a></dd>
           <dt>offset</dt>
           <dd>0</dd>
           <dt>ethereum teleburn address</dt>
-          <dd>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
+          <dd class=collapse>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
         </dl>
       "
       .unindent()
@@ -89,7 +141,7 @@ mod tests {
         inscription: inscription("text/plain;charset=utf-8", "HELLOWORLD"),
         id: inscription_id(1),
         number: 1,
-        output: Some(tx_out(1, address())),
+        output: Some(tx_out(1, address(0))),
         satpoint: satpoint(1, 0),
         ..default()
       },
@@ -103,7 +155,7 @@ mod tests {
         <dl>
           .*
           <dt>address</dt>
-          <dd class=monospace><a href=/address/bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4>bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4</a></dd>
+          <dd><a class=collapse href=/address/bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4>bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4</a></dd>
           <dt>value</dt>
           <dd>1</dd>
           .*
@@ -121,7 +173,7 @@ mod tests {
         inscription: inscription("text/plain;charset=utf-8", "HELLOWORLD"),
         id: inscription_id(1),
         number: 1,
-        output: Some(tx_out(1, address())),
+        output: Some(tx_out(1, address(0))),
         sat: Some(Sat(1)),
         satpoint: satpoint(1, 0),
         ..default()
@@ -153,7 +205,7 @@ mod tests {
         id: inscription_id(2),
         next: Some(inscription_id(3)),
         number: 1,
-        output: Some(tx_out(1, address())),
+        output: Some(tx_out(1, address(0))),
         previous: Some(inscription_id(1)),
         satpoint: satpoint(1, 0),
         ..default()
@@ -179,7 +231,7 @@ mod tests {
         inscription: inscription("text/plain;charset=utf-8", "HELLOWORLD"),
         id: inscription_id(2),
         number: -1,
-        output: Some(tx_out(1, address())),
+        output: Some(tx_out(1, address(0))),
         satpoint: SatPoint {
           outpoint: unbound_outpoint(),
           offset: 0
@@ -193,9 +245,9 @@ mod tests {
         <dl>
           .*
           <dt>location</dt>
-          <dd class=monospace>0{64}:0:0</dd>
+          <dd><a class=collapse href=/satpoint/0{64}:0:0>0{64}:0:0</a></dd>
           <dt>output</dt>
-          <dd><a class=monospace href=/output/0{64}:0>0{64}:0</a></dd>
+          <dd><a class=collapse href=/output/0{64}:0>0{64}:0</a></dd>
           .*
         </dl>
       "
@@ -233,7 +285,7 @@ mod tests {
             </div>
           </dd>
           <dt>id</dt>
-          <dd class=monospace>1{64}i1</dd>
+          <dd class=collapse>1{64}i1</dd>
           <dt>preview</dt>
           <dd><a href=/preview/1{64}i1>link</a></dd>
           <dt>content</dt>
@@ -249,15 +301,15 @@ mod tests {
           <dt>fee</dt>
           <dd>1</dd>
           <dt>reveal transaction</dt>
-          <dd><a class=monospace href=/tx/1{64}>1{64}</a></dd>
+          <dd><a class=collapse href=/tx/1{64}>1{64}</a></dd>
           <dt>location</dt>
-          <dd class=monospace>1{64}:1:0</dd>
+          <dd><a class=collapse href=/satpoint/1{64}:1:0>1{64}:1:0</a></dd>
           <dt>output</dt>
-          <dd><a class=monospace href=/output/1{64}:1>1{64}:1</a></dd>
+          <dd><a class=collapse href=/output/1{64}:1>1{64}:1</a></dd>
           <dt>offset</dt>
           <dd>0</dd>
           <dt>ethereum teleburn address</dt>
-          <dd>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
+          <dd class=collapse>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
         </dl>
 "
       .unindent()
@@ -268,6 +320,7 @@ mod tests {
   fn with_children() {
     assert_regex_match!(
       InscriptionHtml {
+        child_count: 2,
         children: vec![inscription_id(2), inscription_id(3)],
         fee: 1,
         inscription: inscription("text/plain;charset=utf-8", "HELLOWORLD"),
@@ -291,11 +344,11 @@ mod tests {
               <a href=/inscription/3{64}i3><iframe .* src=/preview/3{64}i3></iframe></a>
             </div>
             <div class=center>
-              <a href=/children/1{64}i1>all</a>
+              <a href=/children/1{64}i1>all \\(2\\)</a>
             </div>
           </dd>
           <dt>id</dt>
-          <dd class=monospace>1{64}i1</dd>
+          <dd class=collapse>1{64}i1</dd>
           <dt>preview</dt>
           <dd><a href=/preview/1{64}i1>link</a></dd>
           <dt>content</dt>
@@ -311,15 +364,15 @@ mod tests {
           <dt>fee</dt>
           <dd>1</dd>
           <dt>reveal transaction</dt>
-          <dd><a class=monospace href=/tx/1{64}>1{64}</a></dd>
+          <dd><a class=collapse href=/tx/1{64}>1{64}</a></dd>
           <dt>location</dt>
-          <dd class=monospace>1{64}:1:0</dd>
+          <dd><a class=collapse href=/satpoint/1{64}:1:0>1{64}:1:0</a></dd>
           <dt>output</dt>
-          <dd><a class=monospace href=/output/1{64}:1>1{64}:1</a></dd>
+          <dd><a class=collapse href=/output/1{64}:1>1{64}:1</a></dd>
           <dt>offset</dt>
           <dd>0</dd>
           <dt>ethereum teleburn address</dt>
-          <dd>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
+          <dd class=collapse>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
         </dl>
       "
       .unindent()
@@ -330,6 +383,7 @@ mod tests {
   fn with_paginated_children() {
     assert_regex_match!(
       InscriptionHtml {
+        child_count: 1,
         children: vec![inscription_id(2)],
         fee: 1,
         inscription: inscription("text/plain;charset=utf-8", "HELLOWORLD"),
@@ -352,11 +406,11 @@ mod tests {
               <a href=/inscription/2{64}i2><iframe .* src=/preview/2{64}i2></iframe></a>
             </div>
             <div class=center>
-              <a href=/children/1{64}i1>all</a>
+              <a href=/children/1{64}i1>all \\(1\\)</a>
             </div>
           </dd>
           <dt>id</dt>
-          <dd class=monospace>1{64}i1</dd>
+          <dd class=collapse>1{64}i1</dd>
           <dt>preview</dt>
           <dd><a href=/preview/1{64}i1>link</a></dd>
           <dt>content</dt>
@@ -372,15 +426,15 @@ mod tests {
           <dt>fee</dt>
           <dd>1</dd>
           <dt>reveal transaction</dt>
-          <dd><a class=monospace href=/tx/1{64}>1{64}</a></dd>
+          <dd><a class=collapse href=/tx/1{64}>1{64}</a></dd>
           <dt>location</dt>
-          <dd class=monospace>1{64}:1:0</dd>
+          <dd><a class=collapse href=/satpoint/1{64}:1:0>1{64}:1:0</a></dd>
           <dt>output</dt>
-          <dd><a class=monospace href=/output/1{64}:1>1{64}:1</a></dd>
+          <dd><a class=collapse href=/output/1{64}:1>1{64}:1</a></dd>
           <dt>offset</dt>
           <dd>0</dd>
           <dt>ethereum teleburn address</dt>
-          <dd>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
+          <dd class=collapse>0xa1DfBd1C519B9323FD7Fd8e498Ac16c2E502F059</dd>
         </dl>
       "
       .unindent()
@@ -421,7 +475,7 @@ mod tests {
       InscriptionHtml {
         fee: 1,
         inscription: Inscription {
-          content_encoding: Some("br".into()),
+          content_encoding: Some(BROTLI.into()),
           ..inscription("text/plain;charset=utf-8", "HELLOWORLD")
         },
         id: inscription_id(1),
@@ -436,6 +490,47 @@ mod tests {
           .*
           <dt>content encoding</dt>
           <dd>br</dd>
+          .*
+        </dl>
+      "
+      .unindent()
+    );
+  }
+
+  #[test]
+  fn with_burn_metadata() {
+    let script_pubkey = script::Builder::new()
+      .push_opcode(opcodes::all::OP_RETURN)
+      .push_slice([
+        0xA2, 0x63, b'f', b'o', b'o', 0x63, b'b', b'a', b'r', 0x63, b'b', b'a', b'z', 0x01,
+      ])
+      .into_script();
+
+    assert_regex_match!(
+      InscriptionHtml {
+        fee: 1,
+        inscription: Inscription {
+          content_encoding: Some(BROTLI.into()),
+          ..inscription("text/plain;charset=utf-8", "HELLOWORLD")
+        },
+        id: inscription_id(1),
+        number: 1,
+        satpoint: satpoint(1, 0),
+        output: Some(TxOut {
+          value: Amount::from_sat(1),
+          script_pubkey,
+        }),
+        ..default()
+      },
+      "
+        <h1>Inscription 1</h1>
+        .*
+        <dl>
+          .*
+          <dt>burn metadata</dt>
+          <dd>
+            <dl><dt>foo</dt><dd>bar</dd><dt>baz</dt><dd>1</dd></dl>
+          </dd>
           .*
         </dl>
       "

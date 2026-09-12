@@ -1,4 +1,4 @@
-use {super::*, std::num::ParseFloatError};
+use super::*;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Display, Ord, PartialOrd, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -21,12 +21,50 @@ impl Sat {
       + u32::try_from(self.epoch_position() / self.epoch().subsidy()).unwrap()
   }
 
+  pub fn luck(self, block: Header) -> Option<u8> {
+    fn leading_zeros(hash: BlockHash) -> Option<u8> {
+      let mut zeros = 0;
+
+      for byte in hash.to_byte_array().into_iter().rev() {
+        zeros += byte.leading_zeros();
+
+        if byte != 0 {
+          break;
+        }
+      }
+
+      zeros.try_into().ok()
+    }
+
+    if self.common() {
+      return None;
+    }
+
+    let target = BlockHash::from_raw_hash(Hash::from_byte_array(block.target().to_le_bytes()));
+
+    let hash = block.block_hash();
+
+    leading_zeros(hash)?.checked_sub(leading_zeros(target)?)
+  }
+
   pub fn cycle(self) -> u32 {
     Epoch::from(self).0 / CYCLE_EPOCHS
   }
 
   pub fn nineball(self) -> bool {
     self.n() >= 50 * COIN_VALUE * 9 && self.n() < 50 * COIN_VALUE * 10
+  }
+
+  pub fn palindrome(self) -> bool {
+    let mut n = self.0;
+    let mut reversed = 0;
+
+    while n > 0 {
+      reversed = reversed * 10 + n % 10;
+      n /= 10;
+    }
+
+    self.0 == reversed
   }
 
   pub fn percentile(self) -> String {
@@ -57,16 +95,22 @@ impl Sat {
     self.into()
   }
 
-  /// `Sat::rarity` is expensive and is called frequently when indexing.
-  /// Sat::is_common only checks if self is `Rarity::Common` but is
-  /// much faster.
+  /// Is this sat common or not?  Much faster than `Sat::rarity()`.
   pub fn common(self) -> bool {
+    // The block rewards for epochs 0 through 9 are all multiples
+    // of 9765625 (the epoch 9 reward), so any sat from epoch 9 or
+    // earlier that isn't divisible by 9765625 is definitely common.
+    if self < Epoch(10).starting_sat() && !self.0.is_multiple_of(Epoch(9).subsidy()) {
+      return true;
+    }
+
+    // Fall back to the full calculation.
     let epoch = self.epoch();
-    (self.0 - epoch.starting_sat().0) % epoch.subsidy() != 0
+    !(self.0 - epoch.starting_sat().0).is_multiple_of(epoch.subsidy())
   }
 
   pub fn coin(self) -> bool {
-    self.n() % COIN_VALUE == 0
+    self.n().is_multiple_of(COIN_VALUE)
   }
 
   pub fn name(self) -> String {
@@ -89,6 +133,10 @@ impl Sat {
 
     if self.nineball() {
       Charm::Nineball.set(&mut charms);
+    }
+
+    if self.palindrome() {
+      Charm::Palindrome.set(&mut charms);
     }
 
     if self.coin() {
@@ -164,7 +212,7 @@ impl Sat {
     // will increment by 336 every halving.
     let relationship = period_offset + SUBSIDY_HALVING_INTERVAL * CYCLE_EPOCHS - epoch_offset;
 
-    if relationship % HALVING_INCREMENT != 0 {
+    if !relationship.is_multiple_of(HALVING_INCREMENT) {
       return Err(ErrorKind::EpochPeriodMismatch.error(degree));
     }
 
@@ -755,6 +803,16 @@ mod tests {
   }
 
   #[test]
+  fn common_fast_path() {
+    // Exhaustively test the Sat::common() fast path on every
+    // uncommon sat.
+    for height in 0..Epoch::FIRST_POST_SUBSIDY.starting_height().0 {
+      let height = Height(height);
+      assert!(!Sat::common(height.starting_sat()));
+    }
+  }
+
+  #[test]
   fn coin() {
     assert!(Sat(0).coin());
     assert!(!Sat(COIN_VALUE - 1).coin());
@@ -786,5 +844,41 @@ mod tests {
       .to_string(),
       "failed to parse sat `foo`: invalid percentile",
     );
+  }
+
+  #[test]
+  fn palindrome() {
+    assert!(Sat(0).palindrome());
+    assert!(!Sat(10).palindrome());
+    assert!(Sat(11).palindrome());
+  }
+
+  #[test]
+  fn palindrome_charm() {
+    assert!(Charm::Palindrome.is_set(Sat(0).charms()));
+    assert!(!Charm::Palindrome.is_set(Sat(10).charms()));
+    assert!(Charm::Palindrome.is_set(Sat(11).charms()));
+  }
+
+  #[test]
+  fn luck() {
+    let genesis = bitcoin::constants::genesis_block(Network::Bitcoin).header;
+    assert_eq!(Sat(0).luck(genesis), Some(11));
+    assert_eq!(Sat(1).luck(genesis), None);
+  }
+
+  #[test]
+  fn degree_examples() {
+    #[track_caller]
+    fn case(s: &str, rarity: Rarity) {
+      assert_eq!(s.parse::<Sat>().unwrap().rarity(), rarity);
+    }
+
+    case("0°0′0″1‴", Rarity::Common);
+    case("0°1′1″0‴", Rarity::Uncommon);
+    case("0°2016′0″0‴", Rarity::Rare);
+    case("0°0′336″0‴", Rarity::Epic);
+    case("1°0′0″0‴", Rarity::Legendary);
+    case("0°0′0″0‴", Rarity::Mythic);
   }
 }

@@ -1,7 +1,10 @@
 use {
   super::*,
-  ord::subcommand::wallet::{create, inscriptions, receive},
-  std::ops::Deref,
+  ord::{
+    Properties,
+    subcommand::wallet::{create, inscriptions, receive},
+  },
+  std::{io::Read, ops::Deref},
 };
 
 #[test]
@@ -36,7 +39,7 @@ fn inscribe_works_with_huge_expensive_inscriptions() {
 
   create_wallet(&core, &ord);
 
-  let txid = core.mine_blocks(1)[0].txdata[0].txid();
+  let txid = core.mine_blocks(1)[0].txdata[0].compute_txid();
 
   CommandBuilder::new(format!(
     "wallet inscribe --file foo.txt --satpoint {txid}:0:0 --fee-rate 10"
@@ -54,7 +57,7 @@ fn metaprotocol_appears_on_inscription_page() {
 
   create_wallet(&core, &ord);
 
-  let txid = core.mine_blocks(1)[0].txdata[0].txid();
+  let txid = core.mine_blocks(1)[0].txdata[0].compute_txid();
 
   let inscribe = CommandBuilder::new(format!(
     "wallet inscribe --file foo.txt --metaprotocol foo --satpoint {txid}:0:0 --fee-rate 10"
@@ -73,14 +76,39 @@ fn metaprotocol_appears_on_inscription_page() {
 }
 
 #[test]
+fn title_appears_on_inscription_page() {
+  let core = mockcore::spawn();
+  let ord = TestServer::spawn(&core);
+
+  create_wallet(&core, &ord);
+
+  let txid = core.mine_blocks(1)[0].txdata[0].compute_txid();
+
+  let inscribe = CommandBuilder::new(format!(
+    "wallet inscribe --file foo.txt --title foo --satpoint {txid}:0:0 --fee-rate 10"
+  ))
+  .write("foo.txt", [0; 350_000])
+  .core(&core)
+  .ord(&ord)
+  .run_and_deserialize_output::<Batch>();
+
+  core.mine_blocks(1);
+
+  ord.assert_response_regex(
+    format!("/inscription/{}", inscribe.inscriptions[0].id),
+    r".*<dt>title</dt>\s*<dd>foo</dd>.*",
+  );
+}
+
+#[test]
 fn inscribe_fails_if_bitcoin_core_is_too_old() {
-  let core = mockcore::builder().version(230000).build();
+  let core = mockcore::builder().version(240000).build();
   let ord = TestServer::spawn(&core);
 
   CommandBuilder::new("wallet inscribe --file hello.txt --fee-rate 1")
     .write("hello.txt", "HELLOWORLD")
     .expected_exit_code(1)
-    .expected_stderr("error: Bitcoin Core 24.0.0 or newer required, current version is 23.0.0\n")
+    .expected_stderr("error: Bitcoin Core 28.0.0 or newer required, current version is 24.0.0\n")
     .core(&core)
     .ord(&ord)
     .run_and_extract_stdout();
@@ -257,7 +285,7 @@ fn inscribe_with_optional_satpoint_arg() {
 
   create_wallet(&core, &ord);
 
-  let txid = core.mine_blocks(1)[0].txdata[0].txid();
+  let txid = core.mine_blocks(1)[0].txdata[0].compute_txid();
 
   let Batch { inscriptions, .. } = CommandBuilder::new(format!(
     "wallet inscribe --file foo.txt --satpoint {txid}:0:10000 --fee-rate 1"
@@ -301,31 +329,28 @@ fn inscribe_with_fee_rate() {
       .run_and_deserialize_output::<Batch>();
 
   let tx1 = &core.mempool()[0];
-  let mut fee = 0;
+  let mut fee = Amount::ZERO;
   for input in &tx1.input {
-    fee += core
-      .get_utxo_amount(&input.previous_output)
-      .unwrap()
-      .to_sat();
+    fee += core.get_utxo_amount(&input.previous_output).unwrap();
   }
   for output in &tx1.output {
     fee -= output.value;
   }
 
-  let fee_rate = fee as f64 / tx1.vsize() as f64;
+  let fee_rate = fee.to_sat() as f64 / tx1.vsize() as f64;
 
   pretty_assert_eq!(fee_rate, 2.0);
 
   let tx2 = &core.mempool()[1];
-  let mut fee = 0;
+  let mut fee = Amount::ZERO;
   for input in &tx2.input {
-    fee += &tx1.output[input.previous_output.vout as usize].value;
+    fee += tx1.output[input.previous_output.vout as usize].value;
   }
   for output in &tx2.output {
     fee -= output.value;
   }
 
-  let fee_rate = fee as f64 / tx2.vsize() as f64;
+  let fee_rate = fee.to_sat() as f64 / tx2.vsize() as f64;
 
   pretty_assert_eq!(fee_rate, 2.0);
   assert_eq!(
@@ -355,31 +380,28 @@ fn inscribe_with_commit_fee_rate() {
   .run_and_deserialize_output::<Batch>();
 
   let tx1 = &core.mempool()[0];
-  let mut fee = 0;
+  let mut fee = Amount::ZERO;
   for input in &tx1.input {
-    fee += core
-      .get_utxo_amount(&input.previous_output)
-      .unwrap()
-      .to_sat();
+    fee += core.get_utxo_amount(&input.previous_output).unwrap();
   }
   for output in &tx1.output {
     fee -= output.value;
   }
 
-  let fee_rate = fee as f64 / tx1.vsize() as f64;
+  let fee_rate = fee.to_sat() as f64 / tx1.vsize() as f64;
 
   pretty_assert_eq!(fee_rate, 2.0);
 
   let tx2 = &core.mempool()[1];
-  let mut fee = 0;
+  let mut fee = Amount::ZERO;
   for input in &tx2.input {
-    fee += &tx1.output[input.previous_output.vout as usize].value;
+    fee += tx1.output[input.previous_output.vout as usize].value;
   }
   for output in &tx2.output {
     fee -= output.value;
   }
 
-  let fee_rate = fee as f64 / tx2.vsize() as f64;
+  let fee_rate = fee.to_sat() as f64 / tx2.vsize() as f64;
 
   pretty_assert_eq!(fee_rate, 1.0);
 }
@@ -492,10 +514,10 @@ fn inscribe_to_specific_destination() {
   .reveal;
 
   let reveal_tx = &core.mempool()[1]; // item 0 is the commit, item 1 is the reveal.
-  assert_eq!(reveal_tx.txid(), txid);
+  assert_eq!(reveal_tx.compute_txid(), txid);
   assert_eq!(
     reveal_tx.output.first().unwrap().script_pubkey,
-    destination.payload.script_pubkey()
+    destination.assume_checked_ref().script_pubkey()
   );
 }
 
@@ -515,7 +537,7 @@ fn inscribe_to_address_on_different_network() {
   .core(&core)
   .ord(&ord)
   .expected_exit_code(1)
-  .stderr_regex("error: address tb1qsgx55dp6gn53tsmyjjv4c2ye403hgxynxs0dnm belongs to network testnet which is different from required bitcoin\n")
+  .stderr_regex("error: validation error\n\nbecause:\n- address tb1qsgx55dp6gn53tsmyjjv4c2ye403hgxynxs0dnm is not valid on bitcoin\n")
   .run_and_extract_stdout();
 }
 
@@ -528,7 +550,7 @@ fn inscribe_with_no_limit() {
 
   core.mine_blocks(1);
 
-  let one_megger = std::iter::repeat(0).take(1_000_000).collect::<Vec<u8>>();
+  let one_megger = std::iter::repeat_n(0, 1_000_000).collect::<Vec<u8>>();
   CommandBuilder::new("wallet inscribe --no-limit --file degenerate.png --fee-rate 1")
     .write("degenerate.png", one_megger)
     .core(&core)
@@ -623,7 +645,7 @@ fn inscribe_with_parent_inscription_and_fee_rate() {
   .run_and_deserialize_output::<Batch>();
 
   assert_eq!(core.descriptors().len(), 4);
-  assert_eq!(parent_id, child_output.parent.unwrap());
+  assert_eq!(parent_id, *child_output.parents.first().unwrap());
 
   let commit_tx = &core.mempool()[0];
   let reveal_tx = &core.mempool()[1];
@@ -639,7 +661,7 @@ fn inscribe_with_parent_inscription_and_fee_rate() {
   core.mine_blocks(1);
 
   ord.assert_response_regex(
-    format!("/inscription/{}", child_output.parent.unwrap()),
+    format!("/inscription/{}", child_output.parents.first().unwrap()),
     format!(
       ".*<dt>children</dt>.*<a href=/inscription/{}>.*",
       child_output.inscriptions[0].id
@@ -650,7 +672,7 @@ fn inscribe_with_parent_inscription_and_fee_rate() {
     format!("/inscription/{}", child_output.inscriptions[0].id),
     format!(
       ".*<dt>parents</dt>.*<a href=/inscription/{}>.*",
-      child_output.parent.unwrap()
+      child_output.parents.first().unwrap()
     ),
   );
 }
@@ -674,7 +696,7 @@ fn reinscribe_with_flag() {
 
   assert_eq!(core.descriptors().len(), 3);
 
-  let txid = core.mine_blocks(1)[0].txdata[2].txid();
+  let txid = core.mine_blocks(1)[0].txdata[2].compute_txid();
 
   let request = ord.request(format!("/content/{}", inscribe.inscriptions[0].id));
 
@@ -726,7 +748,7 @@ fn with_reinscribe_flag_but_not_actually_a_reinscription() {
     .ord(&ord)
     .run_and_deserialize_output::<Batch>();
 
-  let coinbase = core.mine_blocks(1)[0].txdata[0].txid();
+  let coinbase = core.mine_blocks(1)[0].txdata[0].compute_txid();
 
   CommandBuilder::new(format!(
     "wallet inscribe --file orchid.png --fee-rate 1.1 --reinscribe --satpoint {coinbase}:0:0"
@@ -794,11 +816,13 @@ fn no_metadata_appears_on_inscription_page_if_no_metadata_is_passed() {
 
   core.mine_blocks(1);
 
-  assert!(!ord
-    .request(format!("/inscription/{inscription}"),)
-    .text()
-    .unwrap()
-    .contains("metadata"));
+  assert!(
+    !ord
+      .request(format!("/inscription/{inscription}"),)
+      .text()
+      .unwrap()
+      .contains("metadata")
+  );
 }
 
 #[test]
@@ -910,7 +934,7 @@ fn inscribe_does_not_pick_locked_utxos() {
   create_wallet(&core, &ord);
 
   let coinbase_tx = &core.mine_blocks(1)[0].txdata[0];
-  let outpoint = OutPoint::new(coinbase_tx.txid(), 0);
+  let outpoint = OutPoint::new(coinbase_tx.compute_txid(), 0);
 
   core.lock(outpoint);
 
@@ -1026,6 +1050,43 @@ fn inscriptions_are_not_compressed_if_no_space_is_saved_by_compression() {
 
   assert_eq!(response.status(), StatusCode::OK);
   assert_eq!(response.text().unwrap(), "foo");
+}
+
+#[test]
+fn inscribe_can_compress_properties() {
+  let core = mockcore::spawn();
+  let ord = TestServer::spawn_with_server_args(&core, &[], &[]);
+
+  create_wallet(&core, &ord);
+  core.mine_blocks(1);
+
+  let title = "a]".repeat(100);
+
+  let Batch { reveal, .. } = CommandBuilder::new(format!(
+    "wallet inscribe --compress --fee-rate 1 --file foo.txt --title {title}"
+  ))
+  .write("foo.txt", "foo")
+  .core(&core)
+  .ord(&ord)
+  .run_and_deserialize_output();
+
+  core.mine_blocks(1);
+
+  let response = ord.json_request(format!("/decode/{reveal}"));
+  assert_eq!(response.status(), StatusCode::OK);
+
+  let decode: api::Decode = serde_json::from_str(&response.text().unwrap()).unwrap();
+  let inscription = &decode.inscriptions[0].payload;
+
+  assert_eq!(inscription.property_encoding, Some(b"br".to_vec()));
+
+  let compressed = inscription.properties.as_ref().unwrap();
+  let mut decompressor = brotli::Decompressor::new(compressed.as_slice(), compressed.len());
+  let mut decompressed = Vec::new();
+  decompressor.read_to_end(&mut decompressed).unwrap();
+
+  let properties = minicbor::decode::<Properties>(&decompressed).unwrap();
+  assert_eq!(properties.attributes.title, Some(title));
 }
 
 #[test]
@@ -1229,7 +1290,7 @@ fn inscription_with_delegate_returns_effective_content_type() {
   core.mine_blocks(1);
 
   let inscription_id = inscribe.inscriptions[0].id;
-  let json_response = ord.json_request(format!("/inscription/{}", inscription_id));
+  let json_response = ord.json_request(format!("/inscription/{inscription_id}"));
 
   let inscription_json: api::Inscription =
     serde_json::from_str(&json_response.text().unwrap()).unwrap();
@@ -1260,7 +1321,84 @@ fn file_inscribe_with_non_existent_delegate_inscription() {
   .write("child.png", [1; 520])
   .core(&core)
   .ord(&ord)
-  .expected_stderr(format!("error: delegate {delegate} does not exist\n"))
+  .expected_stderr(format!(
+    "error: referenced inscriptions do not exist: {delegate}\n"
+  ))
+  .expected_exit_code(1)
+  .run_and_extract_stdout();
+}
+
+#[test]
+fn inscribe_can_include_gallery_items() {
+  let core = mockcore::spawn();
+
+  let ord = TestServer::spawn_with_server_args(&core, &[], &[]);
+
+  create_wallet(&core, &ord);
+
+  let (id0, _) = inscribe(&core, &ord);
+  let (id1, _) = inscribe(&core, &ord);
+
+  core.mine_blocks(1);
+
+  let output = CommandBuilder::new(format!(
+    "wallet inscribe --file foo.txt --fee-rate 1 --gallery {id0} --gallery {id1}"
+  ))
+  .write("foo.txt", "Hello World")
+  .core(&core)
+  .ord(&ord)
+  .run_and_deserialize_output::<Batch>();
+
+  core.mine_blocks(1);
+
+  let gallery = output.inscriptions[0].id;
+
+  let request = ord.request(format!("/content/{}", gallery));
+
+  assert_eq!(request.status(), 200);
+  assert_eq!(
+    request.headers().get("content-type").unwrap(),
+    "text/plain;charset=utf-8"
+  );
+  assert_eq!(request.text().unwrap(), "Hello World");
+
+  ord.assert_response_regex(
+    format!("/inscription/{}", gallery),
+    format!(
+      r".*
+  <dt>gallery</dt>
+  <dd>
+    <div class=thumbnails>
+      <a href=/gallery/{gallery}/0>.*</a>
+      <a href=/gallery/{gallery}/1>.*</a>
+    </div>
+  </dd>
+.*"
+    ),
+  );
+}
+
+#[test]
+fn inscribe_fails_if_gallery_inscription_does_not_exist() {
+  let core = mockcore::spawn();
+
+  let ord = TestServer::spawn_with_server_args(&core, &[], &[]);
+
+  create_wallet(&core, &ord);
+
+  core.mine_blocks(1);
+
+  CommandBuilder::new(
+    "wallet inscribe --file foo.txt --fee-rate 1 --gallery \
+    0000000000000000000000000000000000000000000000000000000000000000i0",
+  )
+  .write("foo.txt", "Hello World")
+  .core(&core)
+  .ord(&ord)
+  .expected_stderr(
+    "error: referenced inscriptions do not exist: \
+      0000000000000000000000000000000000000000000000000000000000000000i0\n",
+  )
   .expected_exit_code(1)
   .run_and_extract_stdout();
 }

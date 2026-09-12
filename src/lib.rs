@@ -2,7 +2,8 @@
   clippy::large_enum_variant,
   clippy::result_large_err,
   clippy::too_many_arguments,
-  clippy::type_complexity
+  clippy::type_complexity,
+  mismatched_lifetime_syntaxes
 )]
 #![deny(
   clippy::cast_lossless,
@@ -17,21 +18,29 @@ use {
     blocktime::Blocktime,
     decimal::Decimal,
     deserialize_from_str::DeserializeFromStr,
+    fund_raw_transaction::fund_raw_transaction,
     index::BitcoinCoreRpcResultExt,
     inscriptions::{
       inscription_id,
       media::{self, ImageRendering, Media},
-      teleburn, ParsedEnvelope,
+      teleburn,
     },
+    into_u64::IntoU64,
     into_usize::IntoUsize,
+    option_ext::OptionExt,
+    outgoing::Outgoing,
     representation::Representation,
+    satscard::Satscard,
     settings::Settings,
+    signer::Signer,
     subcommand::{OutputFormat, Subcommand, SubcommandResult},
     tally::Tally,
   },
-  anyhow::{anyhow, bail, ensure, Context, Error},
+  anyhow::{Context, Error, anyhow, bail, ensure},
   bip39::Mnemonic,
   bitcoin::{
+    Amount, Block, KnownHrp, Network, OutPoint, Psbt, Script, ScriptBuf, Sequence, SignedAmount,
+    Transaction, TxIn, TxOut, Txid, Witness,
     address::{Address, NetworkUnchecked},
     blockdata::{
       constants::{DIFFCHANGE_INTERVAL, MAX_SCRIPT_ELEMENT_SIZE, SUBSIDY_HALVING_INTERVAL},
@@ -40,43 +49,44 @@ use {
     consensus::{self, Decodable, Encodable},
     hash_types::{BlockHash, TxMerkleNode},
     hashes::Hash,
-    script, Amount, Block, Network, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn,
-    TxOut, Txid, Witness,
+    policy::MAX_STANDARD_TX_WEIGHT,
+    script,
+    secp256k1::{self, Secp256k1},
+    transaction::Version,
   },
   bitcoincore_rpc::{Client, RpcApi},
+  boilerplate::{Escape, Trusted},
   chrono::{DateTime, TimeZone, Utc},
   ciborium::Value,
   clap::{ArgGroup, Parser},
   error::{ResultExt, SnafuError},
-  html_escaper::{Escape, Trusted},
-  http::HeaderMap,
-  lazy_static::lazy_static,
   ordinals::{
-    varint, Artifact, Charm, Edict, Epoch, Etching, Height, Pile, Rarity, Rune, RuneId, Runestone,
-    Sat, SatPoint, SpacedRune, Terms,
+    Artifact, Charm, Edict, Epoch, Etching, Height, Pile, Rarity, Rune, RuneId, Runestone, Sat,
+    SatPoint, SpacedRune, Terms, varint,
   },
   regex::Regex,
-  reqwest::Url,
+  reqwest::{StatusCode, Url, header::HeaderMap},
   serde::{Deserialize, Deserializer, Serialize},
   serde_with::{DeserializeFromStr, SerializeDisplay},
   snafu::{Backtrace, ErrorCompat, Snafu},
   std::{
     backtrace::BacktraceStatus,
-    cmp::{self, Reverse},
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    borrow::Cow,
+    cmp,
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     ffi::OsString,
     fmt::{self, Display, Formatter},
-    fs,
-    io::{self, Cursor, Read},
+    fs::{self, File},
+    io::{self, BufReader, Cursor, Read},
     mem,
-    net::ToSocketAddrs,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     str::FromStr,
     sync::{
+      Arc, LazyLock, Mutex,
       atomic::{self, AtomicBool},
-      Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -89,9 +99,10 @@ pub use self::{
   chain::Chain,
   fee_rate::FeeRate,
   index::{Index, RuneEntry},
-  inscriptions::{Envelope, Inscription, InscriptionId},
+  inscriptions::{Envelope, Inscription, InscriptionId, ParsedEnvelope, RawEnvelope},
   object::Object,
   options::Options,
+  properties::{Attributes, Item, Properties, Trait, Traits},
   wallet::transaction_builder::{Target, TransactionBuilder},
 };
 
@@ -110,17 +121,23 @@ pub mod decimal;
 mod deserialize_from_str;
 mod error;
 mod fee_rate;
+mod fund_raw_transaction;
 pub mod index;
 mod inscriptions;
+mod into_u64;
 mod into_usize;
 mod macros;
 mod object;
+mod option_ext;
 pub mod options;
 pub mod outgoing;
+mod properties;
 mod re;
 mod representation;
 pub mod runes;
+mod satscard;
 pub mod settings;
+mod signer;
 pub mod subcommand;
 mod tally;
 pub mod templates;
@@ -129,57 +146,28 @@ pub mod wallet;
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 type SnafuResult<T = (), E = SnafuError> = std::result::Result<T, E>;
 
+type BlockHeader = bitcoin::block::Header;
+
+const BROTLI: &str = "br";
+const BROTLI_BUFFER_SIZE: usize = 4096;
+const MAX_STANDARD_OP_RETURN_SIZE: usize = 83;
 const TARGET_POSTAGE: Amount = Amount::from_sat(10_000);
 
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-static LISTENERS: Mutex<Vec<axum_server::Handle>> = Mutex::new(Vec::new());
+static LISTENERS: Mutex<Vec<axum_server::Handle<SocketAddr>>> = Mutex::new(Vec::new());
 static INDEXER: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn fund_raw_transaction(
-  client: &Client,
-  fee_rate: FeeRate,
-  unfunded_transaction: &Transaction,
-) -> Result<Vec<u8>> {
-  let mut buffer = Vec::new();
+#[doc(hidden)]
+#[derive(Deserialize, Serialize)]
+pub struct SimulateRawTransactionResult {
+  #[serde(with = "bitcoin::amount::serde::as_btc")]
+  pub balance_change: SignedAmount,
+}
 
-  {
-    unfunded_transaction.version.consensus_encode(&mut buffer)?;
-    unfunded_transaction.input.consensus_encode(&mut buffer)?;
-    unfunded_transaction.output.consensus_encode(&mut buffer)?;
-    unfunded_transaction
-      .lock_time
-      .consensus_encode(&mut buffer)?;
-  }
-
-  Ok(
-    client
-      .fund_raw_transaction(
-        &buffer,
-        Some(&bitcoincore_rpc::json::FundRawTransactionOptions {
-          // NB. This is `fundrawtransaction`'s `feeRate`, which is fee per kvB
-          // and *not* fee per vB. So, we multiply the fee rate given by the user
-          // by 1000.
-          fee_rate: Some(Amount::from_sat((fee_rate.n() * 1000.0).ceil() as u64)),
-          change_position: Some(unfunded_transaction.output.len().try_into()?),
-          ..default()
-        }),
-        Some(false),
-      )
-      .map_err(|err| {
-        if matches!(
-          err,
-          bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(
-            bitcoincore_rpc::jsonrpc::error::RpcError { code: -6, .. }
-          ))
-        ) {
-          anyhow!("not enough cardinal utxos")
-        } else {
-          err.into()
-        }
-      })?
-      .hex,
-  )
+#[doc(hidden)]
+#[derive(Deserialize, Serialize)]
+pub struct SimulateRawTransactionOptions {
+  include_watchonly: bool,
 }
 
 pub fn timestamp(seconds: u64) -> DateTime<Utc> {
@@ -192,7 +180,7 @@ fn target_as_block_hash(target: bitcoin::Target) -> BlockHash {
   BlockHash::from_raw_hash(Hash::from_byte_array(target.to_le_bytes()))
 }
 
-fn unbound_outpoint() -> OutPoint {
+pub fn unbound_outpoint() -> OutPoint {
   OutPoint {
     txid: Hash::all_zeros(),
     vout: 0,
@@ -201,6 +189,16 @@ fn unbound_outpoint() -> OutPoint {
 
 fn uncheck(address: &Address) -> Address<NetworkUnchecked> {
   address.to_string().parse().unwrap()
+}
+
+pub fn base64_encode(data: &[u8]) -> String {
+  use base64::Engine;
+  base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
+  use base64::Engine;
+  Ok(base64::engine::general_purpose::STANDARD.decode(s)?)
 }
 
 fn default<T: Default>() -> T {
@@ -244,8 +242,24 @@ fn gracefully_shut_down_indexer() {
   }
 }
 
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+  *v == T::default()
+}
+
+/// Nota bene: This function extracts the leaf script from a witness if the
+/// witness could represent a taproot script path spend, respecting and
+/// ignoring the taproot script annex, if present. Note that the witness may
+/// not actually be for a P2TR output, and the leaf script version is ignored.
+/// This means that this function will return scripts for any witness program
+/// version, past and present, as well as for any leaf script version.
+fn unversioned_leaf_script_from_witness(witness: &Witness) -> Option<&Script> {
+  #[allow(deprecated)]
+  witness.tapscript()
+}
+
 pub fn main() {
   env_logger::init();
+
   ctrlc::set_handler(move || {
     if SHUTTING_DOWN.fetch_or(true, atomic::Ordering::Relaxed) {
       process::exit(1);
@@ -297,11 +311,11 @@ pub fn main() {
           eprintln!("- {err}");
         }
 
-        if let Some(backtrace) = err.backtrace() {
-          if backtrace.status() == BacktraceStatus::Captured {
-            eprintln!("backtrace:");
-            eprintln!("{backtrace}");
-          }
+        if let Some(backtrace) = err.backtrace()
+          && backtrace.status() == BacktraceStatus::Captured
+        {
+          eprintln!("backtrace:");
+          eprintln!("{backtrace}");
         }
       }
 

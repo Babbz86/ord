@@ -14,8 +14,8 @@ pub(crate) const PROTOCOL_ID: [u8; 3] = *b"ord";
 pub(crate) const BODY_TAG: [u8; 0] = [];
 
 type Result<T> = std::result::Result<T, script::Error>;
-type RawEnvelope = Envelope<Vec<Vec<u8>>>;
-pub(crate) type ParsedEnvelope = Envelope<Inscription>;
+pub type RawEnvelope = Envelope<Vec<Vec<u8>>>;
+pub type ParsedEnvelope = Envelope<Inscription>;
 
 #[derive(Default, PartialEq, Clone, Serialize, Deserialize, Debug, Eq)]
 pub struct Envelope<T> {
@@ -54,6 +54,8 @@ impl From<RawEnvelope> for ParsedEnvelope {
     let metaprotocol = Tag::Metaprotocol.take(&mut fields);
     let parents = Tag::Parent.take_array(&mut fields);
     let pointer = Tag::Pointer.take(&mut fields);
+    let properties = Tag::Properties.take(&mut fields);
+    let property_encoding = Tag::PropertyEncoding.take(&mut fields);
     let rune = Tag::Rune.take(&mut fields);
 
     let unrecognized_even_field = fields
@@ -78,6 +80,8 @@ impl From<RawEnvelope> for ParsedEnvelope {
         metaprotocol,
         parents,
         pointer,
+        properties,
+        property_encoding,
         rune,
         unrecognized_even_field,
       },
@@ -90,7 +94,7 @@ impl From<RawEnvelope> for ParsedEnvelope {
 }
 
 impl ParsedEnvelope {
-  pub(crate) fn from_transaction(transaction: &Transaction) -> Vec<Self> {
+  pub fn from_transaction(transaction: &Transaction) -> Vec<Self> {
     RawEnvelope::from_transaction(transaction)
       .into_iter()
       .map(|envelope| envelope.into())
@@ -99,14 +103,14 @@ impl ParsedEnvelope {
 }
 
 impl RawEnvelope {
-  pub(crate) fn from_transaction(transaction: &Transaction) -> Vec<Self> {
+  pub fn from_transaction(transaction: &Transaction) -> Vec<Self> {
     let mut envelopes = Vec::new();
 
     for (i, input) in transaction.input.iter().enumerate() {
-      if let Some(tapscript) = input.witness.tapscript() {
-        if let Ok(input_envelopes) = Self::from_tapscript(tapscript, i) {
-          envelopes.extend(input_envelopes);
-        }
+      if let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness)
+        && let Ok(input_envelopes) = Self::from_tapscript(tapscript, i)
+      {
+        envelopes.extend(input_envelopes);
       }
     }
 
@@ -261,7 +265,7 @@ mod tests {
 
   fn parse(witnesses: &[Witness]) -> Vec<ParsedEnvelope> {
     ParsedEnvelope::from_transaction(&Transaction {
-      version: 2,
+      version: Version(2),
       lock_time: LockTime::ZERO,
       input: witnesses
         .iter()
@@ -402,13 +406,13 @@ mod tests {
         &Tag::ContentType.bytes(),
         b"text/plain;charset=utf-8",
         &[9],
-        b"br",
+        BROTLI.as_bytes(),
         &[],
         b"ord",
       ])]),
       vec![ParsedEnvelope {
         payload: Inscription {
-          content_encoding: Some("br".as_bytes().to_vec()),
+          content_encoding: Some(BROTLI.into()),
           ..inscription("text/plain;charset=utf-8", "ord")
         },
         ..default()
@@ -884,8 +888,47 @@ mod tests {
   }
 
   #[test]
+  fn properties_are_parsed_correctly() {
+    assert_eq!(
+      parse(&[envelope(&[
+        &PROTOCOL_ID,
+        &Tag::Properties.bytes(),
+        &[1, 2, 3]
+      ])]),
+      vec![ParsedEnvelope {
+        payload: Inscription {
+          properties: Some(vec![1, 2, 3]),
+          ..default()
+        },
+        ..default()
+      }]
+    );
+  }
+
+  #[test]
+  fn properties_are_parsed_correctly_from_chunks() {
+    assert_eq!(
+      parse(&[envelope(&[
+        &PROTOCOL_ID,
+        &Tag::Properties.bytes(),
+        &[0],
+        &Tag::Properties.bytes(),
+        &[1]
+      ])]),
+      vec![ParsedEnvelope {
+        payload: Inscription {
+          properties: Some(vec![0, 1]),
+          duplicate_field: true,
+          ..default()
+        },
+        ..default()
+      }]
+    );
+  }
+
+  #[test]
   fn pushnum_opcodes_are_parsed_correctly() {
-    const PUSHNUMS: &[(opcodes::All, u8)] = &[
+    const PUSHNUMS: &[(opcodes::Opcode, u8)] = &[
       (opcodes::all::OP_PUSHNUM_NEG1, 0x81),
       (opcodes::all::OP_PUSHNUM_1, 1),
       (opcodes::all::OP_PUSHNUM_2, 2),

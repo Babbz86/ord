@@ -1,13 +1,17 @@
 use {
   super::*,
-  base64::Engine,
-  hyper::{client::HttpConnector, Body, Client, Method, Request, Uri},
-  serde_json::{json, Value},
+  http_body_util::{BodyExt, Full},
+  hyper::{Method, Request, Uri, body::Bytes},
+  hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::TokioExecutor,
+  },
+  serde_json::{Value, json},
 };
 
 pub(crate) struct Fetcher {
   auth: String,
-  client: Client<HttpConnector>,
+  client: Client<HttpConnector, Full<Bytes>>,
   url: Uri,
 }
 
@@ -26,7 +30,7 @@ struct JsonError {
 
 impl Fetcher {
   pub(crate) fn new(settings: &Settings) -> Result<Self> {
-    let client = Client::new();
+    let client = Client::builder(TokioExecutor::new()).build_http();
 
     let url = if settings.bitcoin_rpc_url(None).starts_with("http://") {
       settings.bitcoin_rpc_url(None)
@@ -38,10 +42,7 @@ impl Fetcher {
 
     let (user, password) = settings.bitcoin_credentials()?.get_user_pass()?;
     let auth = format!("{}:{}", user.unwrap(), password.unwrap());
-    let auth = format!(
-      "Basic {}",
-      &base64::engine::general_purpose::STANDARD.encode(auth)
-    );
+    let auth = format!("Basic {}", base64_encode(auth.as_bytes()));
     Ok(Fetcher { client, url, auth })
   }
 
@@ -77,7 +78,7 @@ impl Fetcher {
             ));
           }
 
-          log::info!("failed to fetch raw transactions, retrying: {}", error);
+          log::info!("failed to fetch raw transactions, retrying: {error}");
 
           tokio::time::sleep(Duration::from_millis(100 * u64::pow(2, retries))).await;
           retries += 1;
@@ -97,7 +98,7 @@ impl Fetcher {
     }
 
     // Results from batched JSON-RPC requests can come back in any order, so we must sort them by id
-    results.sort_by(|a, b| a.id.cmp(&b.id));
+    results.sort_by_key(|result| result.id);
 
     let txs = results
       .into_iter()
@@ -125,11 +126,11 @@ impl Fetcher {
       .uri(&self.url)
       .header(hyper::header::AUTHORIZATION, &self.auth)
       .header(hyper::header::CONTENT_TYPE, "application/json")
-      .body(Body::from(body))?;
+      .body(Full::new(Bytes::from(body)))?;
 
     let response = self.client.request(req).await?;
 
-    let buf = hyper::body::to_bytes(response).await?;
+    let buf = response.into_body().collect().await?.to_bytes();
 
     let results: Vec<JsonResponse<String>> = match serde_json::from_slice(&buf) {
       Ok(results) => results,
@@ -138,7 +139,7 @@ impl Fetcher {
           "failed to parse JSON-RPC response: {e}. response: {response}",
           e = e,
           response = String::from_utf8_lossy(&buf)
-        ))
+        ));
       }
     };
 

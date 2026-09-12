@@ -3,20 +3,23 @@
 use {
   self::{command_builder::CommandBuilder, expected::Expected, test_server::TestServer},
   bitcoin::{
+    Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType, Transaction, TxIn, TxOut,
+    Txid, Witness,
     address::{Address, NetworkUnchecked},
-    blockdata::constants::COIN_VALUE,
-    Network, OutPoint, Sequence, Txid, Witness,
+    blockdata::locktime::absolute::LockTime,
+    opcodes, script,
+    transaction::Version,
   },
-  bitcoincore_rpc::bitcoincore_rpc_json::ListDescriptorsResult,
   chrono::{DateTime, Utc},
-  executable_path::executable_path,
   mockcore::TransactionTemplate,
   ord::{
-    api, chain::Chain, decimal::Decimal, outgoing::Outgoing, subcommand::runes::RuneInfo,
-    wallet::batch, InscriptionId, RuneEntry,
+    Inscription, InscriptionId, RuneEntry, api, base64_decode, base64_encode, chain::Chain,
+    decimal::Decimal, outgoing::Outgoing, subcommand::runes::RuneInfo, templates::InscriptionHtml,
+    wallet::ListDescriptorsResult, wallet::batch,
   },
   ordinals::{
-    Artifact, Charm, Edict, Pile, Rarity, Rune, RuneId, Runestone, Sat, SatPoint, SpacedRune,
+    Artifact, COIN_VALUE, Charm, Edict, Pile, Rarity, Rune, RuneId, Runestone, Sat, SatPoint,
+    SpacedRune,
   },
   pretty_assertions::assert_eq as pretty_assert_eq,
   regex::Regex,
@@ -24,7 +27,7 @@ use {
   serde::de::DeserializeOwned,
   std::sync::Arc,
   std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader, Write},
@@ -69,17 +72,21 @@ mod settings;
 mod subsidy;
 mod supply;
 mod traits;
+mod verify;
 mod version;
 mod wallet;
 
 const RUNE: u128 = 99246114928149462;
 
 type Balance = ord::subcommand::wallet::balance::Output;
+type Balances = ord::subcommand::balances::Output;
 type Batch = ord::wallet::batch::Output;
 type Create = ord::subcommand::wallet::create::Output;
 type Inscriptions = Vec<ord::subcommand::wallet::inscriptions::Output>;
 type Send = ord::subcommand::wallet::send::Output;
+type Split = ord::subcommand::wallet::split::Output;
 type Supply = ord::subcommand::supply::Output;
+type Sweep = ord::subcommand::wallet::sweep::Output;
 
 fn create_wallet(core: &mockcore::Handle, ord: &TestServer) {
   CommandBuilder::new(format!("--chain {} wallet create", core.network()))
@@ -99,23 +106,39 @@ fn sats(
     .run_and_deserialize_output::<Vec<ord::subcommand::wallet::sats::OutputRare>>()
 }
 
-fn inscribe(core: &mockcore::Handle, ord: &TestServer) -> (InscriptionId, Txid) {
+fn inscribe_with_options(
+  core: &mockcore::Handle,
+  ord: &TestServer,
+  postage: Option<u64>,
+  fee_rate: u64,
+) -> (InscriptionId, Txid) {
   core.mine_blocks(1);
 
-  let output = CommandBuilder::new(format!(
-    "--chain {} wallet inscribe --fee-rate 1 --file foo.txt",
-    core.network()
-  ))
-  .write("foo.txt", "FOO")
-  .core(core)
-  .ord(ord)
-  .run_and_deserialize_output::<Batch>();
+  let mut command_str = format!(
+    "--chain {} wallet inscribe --fee-rate {} --file foo.txt",
+    core.network(),
+    fee_rate,
+  );
+
+  if let Some(postage_value) = postage {
+    command_str.push_str(&format!(" --postage {postage_value}sat"));
+  }
+
+  let output = CommandBuilder::new(command_str)
+    .write("foo.txt", "FOO")
+    .core(core)
+    .ord(ord)
+    .run_and_deserialize_output::<Batch>();
 
   core.mine_blocks(1);
 
   assert_eq!(output.inscriptions.len(), 1);
 
   (output.inscriptions[0].id, output.reveal)
+}
+
+fn inscribe(core: &mockcore::Handle, ord: &TestServer) -> (InscriptionId, Txid) {
+  inscribe_with_options(core, ord, None, 1)
 }
 
 fn drain(core: &mockcore::Handle, ord: &TestServer) {
@@ -313,6 +336,11 @@ fn batch(core: &mockcore::Handle, ord: &TestServer, batchfile: batch::File) -> E
     mint_definition.push("<dt>mintable</dt>".into());
     mint_definition.push(format!("<dd>{mintable}</dd>"));
 
+    if mintable {
+      mint_definition.push("<dt>progress</dt>".into());
+      mint_definition.push("<dd>0%</dd>".into());
+    }
+
     mint_definition.push("</dl>".into());
     mint_definition.push("</dd>".into());
   } else {
@@ -321,13 +349,7 @@ fn batch(core: &mockcore::Handle, ord: &TestServer, batchfile: batch::File) -> E
 
   let RuneId { block, tx } = id;
 
-  let supply_int = supply.to_integer(divisibility).unwrap();
-  let premine_int = premine.to_integer(divisibility).unwrap();
-
-  let mint_progress = Decimal {
-    value: ((premine_int as f64 / supply_int as f64) * 10000.0) as u128,
-    scale: 2,
-  };
+  let turbo_class = if turbo { " class=turbo" } else { "" };
 
   ord.assert_response_regex(
     format!("/rune/{rune}"),
@@ -342,8 +364,6 @@ fn batch(core: &mockcore::Handle, ord: &TestServer, batchfile: batch::File) -> E
   {}
   <dt>supply</dt>
   <dd>{premine} {symbol}</dd>
-  <dt>mint progress</dt>
-  <dd>{mint_progress}%</dd>
   <dt>premine</dt>
   <dd>{premine} {symbol}</dd>
   <dt>premine percentage</dt>
@@ -355,11 +375,11 @@ fn batch(core: &mockcore::Handle, ord: &TestServer, batchfile: batch::File) -> E
   <dt>symbol</dt>
   <dd>{symbol}</dd>
   <dt>turbo</dt>
-  <dd>{turbo}</dd>
+  <dd{turbo_class}>{turbo}</dd>
   <dt>etching</dt>
-  <dd><a class=monospace href=/tx/{reveal}>{reveal}</a></dd>
+  <dd><a class=collapse href=/tx/{reveal}>{reveal}</a></dd>
   <dt>parent</dt>
-  <dd><a class=monospace href=/inscription/{parent}>{parent}</a></dd>
+  <dd><a class=collapse href=/inscription/{parent}>{parent}</a></dd>
 .*",
       mint_definition.join("\\s+"),
     ),

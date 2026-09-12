@@ -18,11 +18,10 @@ impl Entry for Header {
   }
 
   fn store(self) -> Self::Value {
-    let mut buffer = Cursor::new([0; 80]);
+    let mut buffer = [0; 80];
     let len = self
-      .consensus_encode(&mut buffer)
+      .consensus_encode(&mut buffer.as_mut_slice())
       .expect("in-memory writers don't error");
-    let buffer = buffer.into_inner();
     debug_assert_eq!(len, buffer.len());
     buffer
   }
@@ -62,16 +61,16 @@ impl RuneEntry {
       return Err(MintError::Unmintable);
     };
 
-    if let Some(start) = self.start() {
-      if height < start {
-        return Err(MintError::Start(start));
-      }
+    if let Some(start) = self.start()
+      && height < start
+    {
+      return Err(MintError::Start(start));
     }
 
-    if let Some(end) = self.end() {
-      if height >= end {
-        return Err(MintError::End(end));
-      }
+    if let Some(end) = self.end()
+      && height >= end
+    {
+      return Err(MintError::End(end));
     }
 
     let cap = terms.cap.unwrap_or_default();
@@ -293,6 +292,7 @@ pub struct InscriptionEntry {
   pub charms: u16,
   pub fee: u64,
   pub height: u32,
+  pub hidden: bool,
   pub id: InscriptionId,
   pub inscription_number: i32,
   pub parents: Vec<u32>,
@@ -305,6 +305,7 @@ pub(crate) type InscriptionEntryValue = (
   u16,                // charms
   u64,                // fee
   u32,                // height
+  bool,               // hidden
   InscriptionIdValue, // inscription id
   i32,                // inscription number
   Vec<u32>,           // parents
@@ -322,6 +323,7 @@ impl Entry for InscriptionEntry {
       charms,
       fee,
       height,
+      hidden,
       id,
       inscription_number,
       parents,
@@ -334,6 +336,7 @@ impl Entry for InscriptionEntry {
       charms,
       fee,
       height,
+      hidden,
       id: InscriptionId::load(id),
       inscription_number,
       parents,
@@ -348,6 +351,7 @@ impl Entry for InscriptionEntry {
       self.charms,
       self.fee,
       self.height,
+      self.hidden,
       self.id.store(),
       self.inscription_number,
       self.parents,
@@ -422,7 +426,7 @@ impl Entry for OutPoint {
   type Value = OutPointValue;
 
   fn load(value: Self::Value) -> Self {
-    Decodable::consensus_decode(&mut Cursor::new(value)).unwrap()
+    Decodable::consensus_decode(&mut bitcoin::io::Cursor::new(value)).unwrap()
   }
 
   fn store(self) -> Self::Value {
@@ -432,33 +436,13 @@ impl Entry for OutPoint {
   }
 }
 
-pub(super) type TxOutValue = (
-  u64,     // value
-  Vec<u8>, // script_pubkey
-);
-
-impl Entry for TxOut {
-  type Value = TxOutValue;
-
-  fn load(value: Self::Value) -> Self {
-    Self {
-      value: value.0,
-      script_pubkey: ScriptBuf::from_bytes(value.1),
-    }
-  }
-
-  fn store(self) -> Self::Value {
-    (self.value, self.script_pubkey.to_bytes())
-  }
-}
-
 pub(super) type SatPointValue = [u8; 44];
 
 impl Entry for SatPoint {
   type Value = SatPointValue;
 
   fn load(value: Self::Value) -> Self {
-    Decodable::consensus_decode(&mut Cursor::new(value)).unwrap()
+    Decodable::consensus_decode(&mut bitcoin::io::Cursor::new(value)).unwrap()
   }
 
   fn store(self) -> Self::Value {
@@ -490,7 +474,7 @@ impl Entry for SatRange {
   fn store(self) -> Self::Value {
     let base = self.0;
     let delta = self.1 - self.0;
-    let n = u128::from(base) | u128::from(delta) << 51;
+    let n = u128::from(base) | (u128::from(delta) << 51);
     n.to_le_bytes()[0..11].try_into().unwrap()
   }
 }
@@ -514,19 +498,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn txout_entry() {
-    let txout = TxOut {
-      value: u64::MAX,
-      script_pubkey: change(0).script_pubkey(),
-    };
-
-    let value = (u64::MAX, change(0).script_pubkey().to_bytes());
-
-    assert_eq!(txout.clone().store(), value);
-    assert_eq!(TxOut::load(value), txout);
-  }
-
-  #[test]
   fn inscription_entry() {
     let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefi0"
       .parse::<InscriptionId>()
@@ -536,6 +507,7 @@ mod tests {
       charms: 0,
       fee: 1,
       height: 2,
+      hidden: false,
       id,
       inscription_number: 3,
       parents: vec![4, 5, 6],
@@ -544,7 +516,7 @@ mod tests {
       timestamp: 9,
     };
 
-    let value = (0, 1, 2, id.store(), 3, vec![4, 5, 6], Some(7), 8, 9);
+    let value = (0, 1, 2, false, id.store(), 3, vec![4, 5, 6], Some(7), 8, 9);
 
     assert_eq!(entry.clone().store(), value);
     assert_eq!(InscriptionEntry::load(value), entry);

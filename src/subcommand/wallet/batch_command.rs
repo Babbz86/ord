@@ -6,7 +6,8 @@ pub(crate) struct Batch {
   shared: SharedArgs,
   #[arg(
     long,
-    help = "Inscribe multiple inscriptions and rune defined in YAML <BATCH_FILE>."
+    help = "Inscribe multiple inscriptions and rune defined in YAML <BATCH_FILE>.",
+    value_name = "BATCH_FILE"
   )]
   pub(crate) batch: PathBuf,
 }
@@ -17,12 +18,35 @@ impl Batch {
 
     let batchfile = batch::File::load(&self.batch)?;
 
-    let parent_info = wallet.get_parent_info(batchfile.parent)?;
+    let mut ids = BTreeSet::new();
+
+    for inscription in &batchfile.inscriptions {
+      if let Some(delegate) = inscription.delegate {
+        ids.insert(delegate);
+      }
+
+      for item in &inscription.gallery {
+        ids.insert(item.id);
+      }
+    }
+
+    let missing = wallet.missing_inscriptions(&ids.into_iter().collect::<Vec<InscriptionId>>())?;
+
+    ensure! {
+      missing.is_empty(),
+      "inscriptions referenced in batchfile do not exist: {}",
+      missing.into_iter().map(|id| id.to_string()).collect::<Vec<String>>().join(", "),
+    }
+
+    let parent_info = wallet.get_parent_info(&batchfile.parents)?;
 
     let (inscriptions, reveal_satpoints, postages, destinations) = batchfile.inscriptions(
       &wallet,
       utxos,
-      parent_info.as_ref().map(|info| info.tx_out.value),
+      parent_info
+        .iter()
+        .map(|info| info.tx_out.value.to_sat())
+        .collect(),
       self.shared.compress,
     )?;
 
@@ -60,7 +84,7 @@ impl Batch {
     }
     .inscribe(
       &locked_utxos.into_keys().collect(),
-      wallet.get_runic_outputs()?,
+      wallet.get_runic_outputs()?.unwrap_or_default(),
       utxos,
       &wallet,
     )
@@ -146,16 +170,16 @@ impl Batch {
 
       if let Some(end) = terms.height.and_then(|range| range.end) {
         ensure!(
-          end > reveal_height.into(),
+          end > u64::from(reveal_height),
           "`terms.height.end` must be greater than the reveal transaction block height of {reveal_height}"
         );
       }
 
       if let Some(start) = terms.height.and_then(|range| range.start) {
         ensure!(
-            start > reveal_height.into(),
-            "`terms.height.start` must be greater than the reveal transaction block height of {reveal_height}"
-          );
+          start > u64::from(reveal_height),
+          "`terms.height.start` must be greater than the reveal transaction block height of {reveal_height}"
+        );
       }
 
       ensure!(terms.cap > 0, "`terms.cap` must be greater than zero");
@@ -204,7 +228,8 @@ mod tests {
       &batch_path,
       format!(
         "mode: separate-outputs
-parent: {parent}
+parents:
+- {parent}
 inscriptions:
 - file: {}
   metadata:
@@ -241,7 +266,7 @@ inscriptions:
             ..default()
           }
         ],
-        parent: Some(parent),
+        parents: vec![parent],
         ..default()
       }
     );
@@ -257,9 +282,11 @@ inscriptions:
     )
     .unwrap();
 
-    assert!(batch::File::load(&batch_path)
-      .unwrap_err()
-      .to_string()
-      .contains("unknown field `unknown`"));
+    assert!(
+      batch::File::load(&batch_path)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field `unknown`")
+    );
   }
 }

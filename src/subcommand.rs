@@ -9,13 +9,15 @@ pub mod index;
 pub mod list;
 pub mod parse;
 pub mod runes;
-pub(crate) mod server;
+pub mod server;
 mod settings;
 pub mod subsidy;
 pub mod supply;
 pub mod teleburn;
 pub mod traits;
+pub mod verify;
 pub mod wallet;
+pub mod wallets;
 
 #[derive(Debug, Parser)]
 pub(crate) enum Subcommand {
@@ -49,8 +51,12 @@ pub(crate) enum Subcommand {
   Teleburn(teleburn::Teleburn),
   #[command(about = "Display satoshi traits")]
   Traits(traits::Traits),
+  #[command(about = "Verify BIP322 signature")]
+  Verify(verify::Verify),
   #[command(about = "Wallet commands")]
   Wallet(wallet::WalletCommand),
+  #[command(about = "List all Bitcoin Core wallets")]
+  Wallets,
 }
 
 impl Subcommand {
@@ -69,14 +75,16 @@ impl Subcommand {
         let index = Arc::new(Index::open(&settings)?);
         let handle = axum_server::Handle::new();
         LISTENERS.lock().unwrap().push(handle.clone());
-        server.run(settings, index, handle)
+        server.run(settings, index, handle, None)
       }
       Self::Settings => settings::run(settings),
       Self::Subsidy(subsidy) => subsidy.run(),
       Self::Supply => supply::run(),
       Self::Teleburn(teleburn) => teleburn.run(),
       Self::Traits(traits) => traits.run(),
+      Self::Verify(verify) => verify.run(),
       Self::Wallet(wallet) => wallet.run(settings),
+      Self::Wallets => wallets::run(settings),
     }
   }
 }

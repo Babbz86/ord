@@ -1,4 +1,4 @@
-use {super::*, ciborium::value::Integer, ord::subcommand::wallet::send::Output};
+use {super::*, ciborium::value::Integer, ord::Properties, ord::subcommand::wallet::send::Output};
 
 #[test]
 fn run() {
@@ -18,10 +18,10 @@ fn run() {
   let mut child = command.spawn().unwrap();
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/status")) {
-      if response.status() == 200 {
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/status"))
+      && response.status() == 200
+    {
+      break;
     }
 
     if attempt == 100 {
@@ -32,6 +32,7 @@ fn run() {
   }
 
   child.kill().unwrap();
+  child.wait().unwrap();
 }
 
 #[test]
@@ -54,7 +55,7 @@ fn address_page_shows_outputs_and_sat_balance() {
   ord.assert_response_regex(
     format!("/address/{address}"),
     format!(
-      ".*<h1>Address {address}</h1>.*<dd>200000000</dd>.*<a class=monospace href=/output/{}.*",
+      ".*<h1>Address {address}</h1>.*<dd>200000000</dd>.*<a class=collapse href=/output/{}.*",
       OutPoint {
         txid: send.txid,
         vout: 0
@@ -233,52 +234,96 @@ fn inscription_page() {
 
   let (inscription, reveal) = inscribe(&core, &ord);
 
-  let ethereum_teleburn_address = CommandBuilder::new(format!("teleburn {inscription}"))
-    .core(&core)
-    .run_and_deserialize_output::<ord::subcommand::teleburn::Output>()
-    .ethereum;
+  let response = ord.json_request(format!(
+    "/output/{}",
+    OutPoint {
+      txid: reveal,
+      vout: 0
+    }
+  ));
 
-  TestServer::spawn_with_args(&core, &[]).assert_response_regex(
+  assert_eq!(response.status(), StatusCode::OK);
+
+  let output: api::Output = serde_json::from_str(&response.text().unwrap()).unwrap();
+
+  TestServer::spawn_with_args(&core, &[]).assert_html(
     format!("/inscription/{inscription}"),
-    format!(
-      ".*<meta property=og:title content='Inscription 0'>.*
-.*<meta property=og:image content='https://.*/favicon.png'>.*
-.*<meta property=twitter:card content=summary>.*
-<h1>Inscription 0</h1>
-.*<iframe .* src=/preview/{inscription}></iframe>.*
-<dl>
-  <dt>id</dt>
-  <dd class=monospace>{inscription}</dd>
-  <dt>address</dt>
-  <dd class=monospace><a href=/address/bc1.*>bc1.*</a></dd>
-  <dt>value</dt>
-  <dd>10000</dd>
-  <dt>preview</dt>
-  <dd><a href=/preview/{inscription}>link</a></dd>
-  <dt>content</dt>
-  <dd><a href=/content/{inscription}>link</a></dd>
-  <dt>content length</dt>
-  <dd>3 bytes</dd>
-  <dt>content type</dt>
-  <dd>text/plain;charset=utf-8</dd>
-  <dt>timestamp</dt>
-  <dd><time>1970-01-01 00:00:02 UTC</time></dd>
-  <dt>height</dt>
-  <dd><a href=/block/2>2</a></dd>
-  <dt>fee</dt>
-  <dd>138</dd>
-  <dt>reveal transaction</dt>
-  <dd><a class=monospace href=/tx/{reveal}>{reveal}</a></dd>
-  <dt>location</dt>
-  <dd class=monospace>{reveal}:0:0</dd>
-  <dt>output</dt>
-  <dd><a class=monospace href=/output/{reveal}:0>{reveal}:0</a></dd>
-  <dt>offset</dt>
-  <dd>0</dd>
-  <dt>ethereum teleburn address</dt>
-  <dd>{ethereum_teleburn_address}</dd>
-</dl>.*",
-    ),
+    Chain::Mainnet,
+    InscriptionHtml {
+      chain: Chain::Mainnet,
+      charms: 0,
+      child_count: 0,
+      children: Vec::new(),
+      fee: 138,
+      height: 2,
+      inscription: Inscription {
+        content_type: Some("text/plain;charset=utf-8".as_bytes().into()),
+        body: Some("foo".as_bytes().into()),
+        ..default()
+      },
+      id: inscription,
+      number: 0,
+      next: None,
+      output: Some(TxOut {
+        value: Amount::from_sat(10000),
+        script_pubkey: output.script_pubkey,
+      }),
+      properties: Properties::default(),
+      parents: Vec::new(),
+      previous: None,
+      rune: None,
+      sat: None,
+      satpoint: SatPoint {
+        outpoint: OutPoint {
+          txid: reveal,
+          vout: 0,
+        },
+        offset: 0,
+      },
+      timestamp: "1970-01-01 00:00:02+00:00"
+        .parse::<DateTime<Utc>>()
+        .unwrap(),
+    },
+  );
+}
+
+#[test]
+fn inscription_page_uses_image_content_as_og_image() {
+  let core = mockcore::spawn();
+  let ord = TestServer::spawn(&core);
+
+  create_wallet(&core, &ord);
+
+  core.mine_blocks(1);
+
+  let output = CommandBuilder::new("wallet inscribe --fee-rate 1 --file foo.png")
+    .write("foo.png", "foo")
+    .core(&core)
+    .ord(&ord)
+    .run_and_deserialize_output::<Batch>();
+
+  core.mine_blocks(1);
+
+  let inscription = output.inscriptions[0].id;
+
+  ord.assert_response_regex(
+    format!("/inscription/{inscription}"),
+    format!(".*<meta property=og:image content='https://[^/]+/content/{inscription}'>.*"),
+  );
+}
+
+#[test]
+fn inscription_page_uses_favicon_as_og_image_for_non_image_content() {
+  let core = mockcore::spawn();
+  let ord = TestServer::spawn(&core);
+
+  create_wallet(&core, &ord);
+
+  let (inscription, _) = inscribe(&core, &ord);
+
+  ord.assert_response_regex(
+    format!("/inscription/{inscription}"),
+    ".*<meta property=og:image content='https://[^/]+/static/favicon.png'>.*",
   );
 }
 
@@ -362,7 +407,7 @@ fn inscription_page_after_send() {
   ord.assert_response_regex(
     format!("/inscription/{inscription}"),
     format!(
-      r".*<h1>Inscription 0</h1>.*<dt>location</dt>\s*<dd class=monospace>{reveal}:0:0</dd>.*",
+      r".*<h1>Inscription 0</h1>.*<dt>location</dt>\s*<dd><a class=collapse href=/satpoint/{reveal}:0:0>{reveal}:0:0</a></dd>.*",
     ),
   );
 
@@ -380,7 +425,7 @@ fn inscription_page_after_send() {
   ord.assert_response_regex(
     format!("/inscription/{inscription}"),
     format!(
-      r".*<h1>Inscription 0</h1>.*<dt>address</dt>\s*<dd class=monospace><a href=/address/bc1qcqgs2pps4u4yedfyl5pysdjjncs8et5utseepv>bc1qcqgs2pps4u4yedfyl5pysdjjncs8et5utseepv</a></dd>.*<dt>location</dt>\s*<dd class=monospace>{txid}:0:0</dd>.*",
+      r".*<h1>Inscription 0</h1>.*<dt>address</dt>\s*<dd><a class=collapse href=/address/bc1qcqgs2pps4u4yedfyl5pysdjjncs8et5utseepv>bc1qcqgs2pps4u4yedfyl5pysdjjncs8et5utseepv</a></dd>.*<dt>location</dt>\s*<dd><a class=collapse href=/satpoint/{txid}:0:0>{txid}:0:0</a></dd>.*",
     ),
   )
 }
@@ -408,7 +453,7 @@ fn inscription_content() {
       .headers()
       .get_all("content-security-policy")
       .into_iter()
-      .collect::<Vec<&http::HeaderValue>>(),
+      .collect::<Vec<&reqwest::header::HeaderValue>>(),
     &[
       "default-src 'self' 'unsafe-eval' 'unsafe-inline' data: blob:",
       "default-src *:*/content/ *:*/blockheight *:*/blockhash *:*/blockhash/ *:*/blocktime *:*/r/ 'unsafe-eval' 'unsafe-inline' data: blob:",
@@ -494,8 +539,11 @@ fn recursive_inscription_endpoint() {
     "application/json"
   );
 
-  let inscription_recursive_json: api::InscriptionRecursive =
+  let mut inscription_recursive_json: api::InscriptionRecursive =
     serde_json::from_str(&response.text().unwrap()).unwrap();
+
+  assert_regex_match!(inscription_recursive_json.address.unwrap(), r"bc1p.*");
+  inscription_recursive_json.address = None;
 
   pretty_assert_eq!(
     inscription_recursive_json,
@@ -516,6 +564,7 @@ fn recursive_inscription_endpoint() {
       },
       timestamp: 2,
       value: Some(10000),
+      address: None,
     }
   )
 }
@@ -589,6 +638,18 @@ fn expected_sat_time_is_rounded() {
   TestServer::spawn_with_args(&core, &[]).assert_response_regex(
     "/sat/2099999997689999",
     r".*<dt>timestamp</dt><dd><time>.* \d+:\d+:\d+ UTC</time> \(expected\)</dd>.*",
+  );
+}
+
+#[test]
+fn sat_page_shows_luck() {
+  let core = mockcore::spawn();
+
+  core.mine_blocks(1);
+
+  TestServer::spawn_with_args(&core, &["--index-sats"]).assert_response_regex(
+    "/sat/0",
+    r#".*<dt>luck</dt><dd><span title="1 in 2048">11</span></dd>.*"#,
   );
 }
 
@@ -671,7 +732,7 @@ fn inscription_transactions_are_stored_with_transaction_index() {
 
   let (_inscription, reveal) = inscribe(&core, &ord);
 
-  let coinbase = core.tx(1, 0).txid();
+  let coinbase = core.tx(1, 0).compute_txid();
 
   assert_eq!(
     ord.request(format!("/tx/{reveal}")).status(),
@@ -719,11 +780,11 @@ fn run_no_sync() {
   core.mine_blocks(1);
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockheight")) {
-      if response.status() == 200 {
-        assert_eq!(response.text().unwrap(), "1");
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockheight"))
+      && response.status() == 200
+    {
+      assert_eq!(response.text().unwrap(), "1");
+      break;
     }
 
     if attempt == 100 {
@@ -734,6 +795,7 @@ fn run_no_sync() {
   }
 
   child.kill().unwrap();
+  child.wait().unwrap();
 
   let builder = CommandBuilder::new(format!(
     "server --no-sync --address 127.0.0.1 --http-port {port}",
@@ -748,11 +810,11 @@ fn run_no_sync() {
   core.mine_blocks(2);
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockheight")) {
-      if response.status() == 200 {
-        assert_eq!(response.text().unwrap(), "1");
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockheight"))
+      && response.status() == 200
+    {
+      assert_eq!(response.text().unwrap(), "1");
+      break;
     }
 
     if attempt == 100 {
@@ -763,6 +825,7 @@ fn run_no_sync() {
   }
 
   child.kill().unwrap();
+  child.wait().unwrap();
 }
 
 #[test]
@@ -785,10 +848,10 @@ fn authentication() {
   let mut child = command.spawn().unwrap();
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}")) {
-      if response.status() == 401 {
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}"))
+      && response.status() == 401
+    {
+      break;
     }
 
     if attempt == 100 {
@@ -807,6 +870,7 @@ fn authentication() {
   assert_eq!(response.status(), 200);
 
   child.kill().unwrap();
+  child.wait().unwrap();
 }
 
 #[cfg(unix)]
@@ -835,10 +899,10 @@ fn ctrl_c() {
     .spawn();
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockcount")) {
-      if response.status() == 200 || response.text().unwrap() == *"3" {
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockcount"))
+      && (response.status() == 200 || response.text().unwrap() == *"3")
+    {
+      break;
     }
 
     if attempt == 100 {
@@ -874,10 +938,10 @@ fn ctrl_c() {
   .spawn();
 
   for attempt in 0.. {
-    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockcount")) {
-      if response.status() == 200 || response.text().unwrap() == *"3" {
-        break;
-      }
+    if let Ok(response) = reqwest::blocking::get(format!("http://localhost:{port}/blockcount"))
+      && (response.status() == 200 || response.text().unwrap() == *"3")
+    {
+      break;
     }
 
     if attempt == 100 {

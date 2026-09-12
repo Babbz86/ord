@@ -17,7 +17,7 @@ pub(super) struct RuneUpdater<'a, 'tx, 'client> {
   pub(super) transaction_id_to_rune: &'a mut Table<'tx, &'static TxidValue, u128>,
 }
 
-impl<'a, 'tx, 'client> RuneUpdater<'a, 'tx, 'client> {
+impl RuneUpdater<'_, '_, '_> {
   pub(super) fn index_runes(&mut self, tx_index: u32, tx: &Transaction, txid: Txid) -> Result<()> {
     let artifact = Runestone::decipher(tx);
 
@@ -26,18 +26,18 @@ impl<'a, 'tx, 'client> RuneUpdater<'a, 'tx, 'client> {
     let mut allocated: Vec<HashMap<RuneId, Lot>> = vec![HashMap::new(); tx.output.len()];
 
     if let Some(artifact) = &artifact {
-      if let Some(id) = artifact.mint() {
-        if let Some(amount) = self.mint(id)? {
-          *unallocated.entry(id).or_default() += amount;
+      if let Some(id) = artifact.mint()
+        && let Some(amount) = self.mint(id)?
+      {
+        *unallocated.entry(id).or_default() += amount;
 
-          if let Some(sender) = self.event_sender {
-            sender.blocking_send(Event::RuneMinted {
-              block_height: self.height,
-              txid,
-              rune_id: id,
-              amount: amount.n(),
-            })?;
-          }
+        if let Some(sender) = self.event_sender {
+          sender.blocking_send(Event::RuneMinted {
+            block_height: self.height,
+            txid,
+            rune_id: id,
+            amount: amount.n(),
+          })?;
         }
       }
 
@@ -406,7 +406,7 @@ impl<'a, 'tx, 'client> RuneUpdater<'a, 'tx, 'client> {
       // extracting a tapscript does not indicate that the input being spent
       // was actually a taproot output. this is checked below, when we load the
       // output's entry from the database
-      let Some(tapscript) = input.witness.tapscript() else {
+      let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness) else {
         continue;
       };
 
@@ -438,7 +438,7 @@ impl<'a, 'tx, 'client> RuneUpdater<'a, 'tx, 'client> {
         let taproot = tx_info.vout[input.previous_output.vout.into_usize()]
           .script_pub_key
           .script()?
-          .is_v1_p2tr();
+          .is_p2tr();
 
         if !taproot {
           continue;
@@ -457,7 +457,7 @@ impl<'a, 'tx, 'client> RuneUpdater<'a, 'tx, 'client> {
           .unwrap()
           + 1;
 
-        if confirmations >= Runestone::COMMIT_CONFIRMATIONS.into() {
+        if confirmations >= u32::from(Runestone::COMMIT_CONFIRMATIONS) {
           return Ok(true);
         }
       }

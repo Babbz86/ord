@@ -11,6 +11,9 @@
   <dt>offset</dt><dd>{{ self.sat.third() }}</dd>
   <dt>timestamp</dt><dd><time>{{self.blocktime.timestamp()}}</time>{{self.blocktime.suffix()}}</dd>
   <dt>rarity</dt><dd><span class={{self.sat.rarity()}}>{{ self.sat.rarity() }}</span></dd>
+%% if let Some(luck) = self.block.and_then(|header| self.sat.luck(header)) {
+  <dt>luck</dt><dd><span title="{{ Self::luck_odds(luck) }}">{{ luck }}</span></dd>
+%% }
 %% let charms = self.sat.charms();
 %% if charms != 0 {
   <dt>charms</dt>
@@ -31,7 +34,10 @@
   </dd>
 %% }
 %% if let Some(satpoint) = self.satpoint {
-  <dt>location</dt><dd class=monospace>{{ satpoint }}</dd>
+  <dt>location</dt><dd><a class=collapse href=/satpoint/{{ satpoint }}>{{ satpoint }}</a></dd>
+%% }
+%% if let Some(address) = &self.address {
+  <dt>address</dt><dd class=monospace><a href=/address/{{address}}>{{ address }}</a></dd>
 %% }
 </dl>
 <div class=center>

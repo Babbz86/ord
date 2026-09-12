@@ -3,14 +3,16 @@ use {super::*, boilerplate::Boilerplate};
 pub(crate) use {
   crate::subcommand::server::ServerConfig,
   address::AddressHtml,
+  attributes::AttributesHtml,
   block::BlockHtml,
   children::ChildrenHtml,
   clock::ClockSvg,
   collections::CollectionsHtml,
+  galleries::GalleriesHtml,
+  gallery::GalleryHtml,
   home::HomeHtml,
   iframe::Iframe,
   input::InputHtml,
-  inscription::InscriptionHtml,
   inscriptions::InscriptionsHtml,
   inscriptions_block::InscriptionsBlockHtml,
   metadata::MetadataHtml,
@@ -20,42 +22,48 @@ pub(crate) use {
     PreviewAudioHtml, PreviewCodeHtml, PreviewFontHtml, PreviewImageHtml, PreviewMarkdownHtml,
     PreviewModelHtml, PreviewPdfHtml, PreviewTextHtml, PreviewUnknownHtml, PreviewVideoHtml,
   },
-  range::RangeHtml,
   rare::RareTxt,
+  rune_not_found::RuneNotFoundHtml,
   sat::SatHtml,
+  satscard::SatscardHtml,
 };
 
 pub use {
-  blocks::BlocksHtml, rune::RuneHtml, runes::RunesHtml, status::StatusHtml,
-  transaction::TransactionHtml,
+  blocks::BlocksHtml, inscription::InscriptionHtml, item::ItemHtml, rune::RuneHtml,
+  runes::RunesHtml, status::StatusHtml, transaction::TransactionHtml,
 };
 
 pub mod address;
+mod attributes;
 pub mod block;
 pub mod blocks;
 mod children;
 mod clock;
 pub mod collections;
+mod galleries;
+mod gallery;
 mod home;
 mod iframe;
 mod input;
 pub mod inscription;
 pub mod inscriptions;
 mod inscriptions_block;
+mod item;
 mod metadata;
 pub mod output;
 mod parents;
 mod preview;
-mod range;
 mod rare;
 pub mod rune;
+pub mod rune_not_found;
 pub mod runes;
 pub mod sat;
+mod satscard;
 pub mod status;
 pub mod transaction;
 
 #[derive(Boilerplate)]
-pub(crate) struct PageHtml<T: PageContent> {
+pub struct PageHtml<T: PageContent> {
   content: T,
   config: Arc<ServerConfig>,
 }
@@ -64,15 +72,20 @@ impl<T> PageHtml<T>
 where
   T: PageContent,
 {
-  pub(crate) fn new(content: T, config: Arc<ServerConfig>) -> Self {
+  pub fn new(content: T, config: Arc<ServerConfig>) -> Self {
     Self { content, config }
   }
 
   fn og_image(&self) -> String {
+    let path = self
+      .content
+      .og_image_path()
+      .unwrap_or_else(|| "/static/favicon.png".into());
+
     if let Some(domain) = &self.config.domain {
-      format!("https://{domain}/static/favicon.png")
+      format!("https://{domain}{path}")
     } else {
-      "https://ordinals.com/static/favicon.png".into()
+      format!("https://ordinals.com{path}")
     }
   }
 
@@ -85,7 +98,7 @@ where
   }
 }
 
-pub(crate) trait PageContent: Display + 'static {
+pub trait PageContent: Display + 'static {
   fn title(&self) -> String;
 
   fn page(self, server_config: Arc<ServerConfig>) -> PageHtml<Self>
@@ -93,6 +106,10 @@ pub(crate) trait PageContent: Display + 'static {
     Self: Sized,
   {
     PageHtml::new(self, server_config)
+  }
+
+  fn og_image_path(&self) -> Option<String> {
+    None
   }
 }
 
@@ -139,7 +156,7 @@ mod tests {
     <link rel=icon href=/static/favicon.svg>
     <link rel=stylesheet href=/static/index.css>
     <link rel=stylesheet href=/static/modern-normalize.css>
-    <script src=/static/index.js defer></script>
+    <script src=/static/index.js></script>
   </head>
   <body>
   <header>

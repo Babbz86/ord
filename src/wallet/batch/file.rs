@@ -1,17 +1,19 @@
 use super::*;
 
+#[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct File {
-  pub inscriptions: Vec<Entry>,
   pub mode: Mode,
-  pub parent: Option<InscriptionId>,
+  #[serde(default)]
+  pub parents: Vec<InscriptionId>,
   pub postage: Option<u64>,
   #[serde(default)]
   pub reinscribe: bool,
-  pub etching: Option<batch::Etching>,
   pub sat: Option<Sat>,
   pub satpoint: Option<SatPoint>,
+  pub inscriptions: Vec<batch::Entry>,
+  pub etching: Option<batch::Etching>,
 }
 
 impl File {
@@ -35,7 +37,7 @@ impl File {
     if sat_or_satpoint {
       ensure!(
         batchfile.mode == Mode::SameSat,
-        "neither `sat` nor `satpoint` can be set in `same-sat` mode",
+        "`sat` or `satpoint` can only be set in `same-sat` mode",
       );
     }
 
@@ -50,6 +52,18 @@ impl File {
       );
     }
 
+    for inscription in &batchfile.inscriptions {
+      let mut items = BTreeSet::new();
+
+      for item in &inscription.gallery {
+        ensure! {
+          items.insert(item.id),
+          "duplicate gallery item: {}",
+          item.id,
+        }
+      }
+    }
+
     let any_entry_has_satpoint = batchfile
       .inscriptions
       .iter()
@@ -62,7 +76,10 @@ impl File {
       );
 
       ensure!(
-        batchfile.inscriptions.iter().all(|entry| entry.satpoint.is_some()),
+        batchfile
+          .inscriptions
+          .iter()
+          .all(|entry| entry.satpoint.is_some()),
         "if `satpoint` is set for any inscription, then all inscriptions need to specify a satpoint"
       );
 
@@ -107,7 +124,7 @@ impl File {
     &self,
     wallet: &Wallet,
     utxos: &BTreeMap<OutPoint, TxOut>,
-    parent_value: Option<u64>,
+    parent_values: Vec<u64>,
     compress: bool,
   ) -> Result<(
     Vec<Inscription>,
@@ -119,25 +136,32 @@ impl File {
     let mut reveal_satpoints = Vec::new();
     let mut postages = Vec::new();
 
-    let mut pointer = parent_value.unwrap_or_default();
+    let mut pointer = parent_values.iter().sum();
 
     for (i, entry) in self.inscriptions.iter().enumerate() {
-      if let Some(delegate) = entry.delegate {
-        ensure! {
-          wallet.inscription_exists(delegate)?,
-          "delegate {delegate} does not exist"
-        }
-      }
-
       inscriptions.push(Inscription::new(
         wallet.chain(),
         compress,
         entry.delegate,
         entry.metadata()?,
         entry.metaprotocol.clone(),
-        self.parent.into_iter().collect(),
+        self.parents.clone(),
         entry.file.clone(),
         Some(pointer),
+        Properties {
+          gallery: entry
+            .gallery
+            .clone()
+            .into_iter()
+            .map(|item| Item {
+              id: Some(item.id),
+              attributes: item.attributes,
+              index: None,
+            })
+            .collect(),
+          attributes: entry.attributes.clone(),
+          txids: Vec::new(),
+        },
         self
           .etching
           .and_then(|etch| (i == 0).then_some(etch.rune.rune)),
@@ -156,19 +180,17 @@ impl File {
 
         txout.value
       } else {
-        self
-          .postage
-          .map(Amount::from_sat)
-          .unwrap_or(TARGET_POSTAGE)
-          .to_sat()
+        self.postage.map(Amount::from_sat).unwrap_or(TARGET_POSTAGE)
       };
 
-      pointer += postage;
+      if self.mode != Mode::SameSat {
+        pointer += postage.to_sat();
+      }
 
       if self.mode == Mode::SameSat && i > 0 {
         continue;
       } else {
-        postages.push(Amount::from_sat(postage));
+        postages.push(postage);
       }
     }
 
@@ -366,11 +388,11 @@ inscriptions:
       batch::File::load(Path::new("batch.yaml")).unwrap(),
       batch::File {
         mode: batch::Mode::SeparateOutputs,
-        parent: Some(
+        parents: vec![
           "6ac5cacb768794f4fd7a78bf00f2074891fce68bd65c4ff36e77177237aacacai0"
             .parse()
             .unwrap()
-        ),
+        ],
         postage: Some(12345),
         reinscribe: true,
         sat: None,
@@ -422,6 +444,15 @@ inscriptions:
               );
               mapping
             })),
+            attributes: Attributes {
+              title: Some("Delicious Mangos".into()),
+              traits: Traits {
+                items: vec![
+                  ("color".into(), Trait::String("orange".into())),
+                  ("deliciousness".into(), Trait::Integer(1000)),
+                ],
+              },
+            },
             ..default()
           },
           batch::Entry {
@@ -441,6 +472,35 @@ inscriptions:
               mapping.insert("author".into(), "Satoshi Nakamoto".into());
               mapping
             })),
+            ..default()
+          },
+          batch::Entry {
+            file: Some("gallery.png".into()),
+            gallery: vec![
+              batch::entry::Item {
+                id: "a4676e57277b70171d69dc6ad2781485b491fe0ff5870f6f6b01999e7180b29ei0"
+                  .parse()
+                  .unwrap(),
+                attributes: Attributes {
+                  title: Some("Incredible".into()),
+                  traits: Traits {
+                    items: vec![
+                      ("background".into(), Trait::String("blue".into())),
+                      ("cool".into(), Trait::Bool(true)),
+                    ],
+                  },
+                },
+              },
+              batch::entry::Item {
+                id: "a4676e57277b70171d69dc6ad2781485b491fe0ff5870f6f6b01999e7180b29ei3"
+                  .parse()
+                  .unwrap(),
+                attributes: Attributes {
+                  title: None,
+                  traits: Traits::default(),
+                },
+              },
+            ],
             ..default()
           },
         ],
@@ -463,5 +523,30 @@ inscriptions:
     .unwrap();
 
     assert!(batch::File::load(batch_file.as_path()).is_ok());
+  }
+
+  #[test]
+  fn batchfile_no_duplicate_gallery_items() {
+    let tempdir = TempDir::new().unwrap();
+    let batch_file = tempdir.path().join("batch.yaml");
+    fs::write(
+      batch_file.clone(),
+      r#"
+mode: separate-outputs
+inscriptions:
+- file: inscription.txt
+  gallery:
+  - id: 6ac5cacb768794f4fd7a78bf00f2074891fce68bd65c4ff36e77177237aacacai0
+  - id: 6ac5cacb768794f4fd7a78bf00f2074891fce68bd65c4ff36e77177237aacacai0
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+      batch::File::load(batch_file.as_path())
+        .unwrap_err()
+        .to_string(),
+      "duplicate gallery item: 6ac5cacb768794f4fd7a78bf00f2074891fce68bd65c4ff36e77177237aacacai0"
+    );
   }
 }

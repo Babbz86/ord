@@ -25,65 +25,67 @@ enum Origin {
   New {
     cursed: bool,
     fee: u64,
+    gallery: bool,
     hidden: bool,
     parents: Vec<InscriptionId>,
-    pointer: Option<u64>,
     reinscription: bool,
     unbound: bool,
     vindicated: bool,
   },
   Old {
+    sequence_number: u32,
     old_satpoint: SatPoint,
   },
 }
 
 pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) blessed_inscription_count: u64,
-  pub(super) chain: Chain,
-  pub(super) content_type_to_count: &'a mut Table<'tx, Option<&'static [u8]>, u64>,
+  pub(super) collection_to_latest_child: &'a mut Table<'tx, u32, u32>,
   pub(super) cursed_inscription_count: u64,
-  pub(super) event_sender: Option<&'a mpsc::Sender<Event>>,
   pub(super) flotsam: Vec<Flotsam>,
+  pub(super) gallery_sequence_numbers: &'a mut Table<'tx, u32, ()>,
   pub(super) height: u32,
   pub(super) home_inscription_count: u64,
   pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
   pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u32>,
-  pub(super) index_addresses: bool,
-  pub(super) index_transactions: bool,
   pub(super) inscription_number_to_sequence_number: &'a mut Table<'tx, i32, u32>,
+  pub(super) latest_child_to_collection: &'a mut MultimapTable<'tx, u32, u32>,
   pub(super) lost_sats: u64,
   pub(super) next_sequence_number: u32,
-  pub(super) outpoint_to_txout: &'a mut Table<'tx, &'static OutPointValue, TxOutValue>,
   pub(super) reward: u64,
-  pub(super) transaction_buffer: Vec<u8>,
-  pub(super) transaction_id_to_transaction: &'a mut Table<'tx, &'static TxidValue, &'static [u8]>,
   pub(super) sat_to_sequence_number: &'a mut MultimapTable<'tx, u64, u32>,
-  pub(super) satpoint_to_sequence_number: &'a mut MultimapTable<'tx, &'static SatPointValue, u32>,
   pub(super) sequence_number_to_children: &'a mut MultimapTable<'tx, u32, u32>,
   pub(super) sequence_number_to_entry: &'a mut Table<'tx, u32, InscriptionEntryValue>,
-  pub(super) sequence_number_to_satpoint: &'a mut Table<'tx, u32, &'static SatPointValue>,
   pub(super) timestamp: u32,
+  pub(super) transaction_buffer: Vec<u8>,
+  pub(super) transaction_id_to_transaction: &'a mut Table<'tx, &'static TxidValue, &'static [u8]>,
   pub(super) unbound_inscriptions: u64,
-  pub(super) utxo_cache: &'a mut HashMap<OutPoint, TxOut>,
-  pub(super) txout_receiver: &'a mut broadcast::Receiver<TxOut>,
 }
 
-impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
+impl InscriptionUpdater<'_, '_> {
   pub(super) fn index_inscriptions(
     &mut self,
     tx: &Transaction,
     txid: Txid,
-    input_sat_ranges: Option<&VecDeque<(u64, u64)>>,
+    input_utxo_entries: &[ParsedUtxoEntry],
+    output_utxo_entries: &mut [UtxoEntryBuf],
+    utxo_cache: &mut HashMap<OutPoint, UtxoEntryBuf>,
+    index: &Index,
+    input_sat_ranges: Option<&Vec<&[u8]>>,
   ) -> Result {
     let mut floating_inscriptions = Vec::new();
     let mut id_counter = 0;
     let mut inscribed_offsets = BTreeMap::new();
-    let jubilant = self.height >= self.chain.jubilee_height();
+    let jubilant = self.height >= index.settings.chain().jubilee_height();
     let mut total_input_value = 0;
-    let total_output_value = tx.output.iter().map(|txout| txout.value).sum::<u64>();
+    let total_output_value = tx
+      .output
+      .iter()
+      .map(|txout| txout.value.to_sat())
+      .sum::<u64>();
 
     let envelopes = ParsedEnvelope::from_transaction(tx);
-    let inscriptions = !envelopes.is_empty();
+    let has_new_inscriptions = !envelopes.is_empty();
     let mut envelopes = envelopes.into_iter().peekable();
 
     for (input_index, txin) in tx.input.iter().enumerate() {
@@ -93,17 +95,33 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
         continue;
       }
 
-      // find existing inscriptions on input (transfers of inscriptions)
-      for (old_satpoint, inscription_id) in Index::inscriptions_on_output(
-        self.satpoint_to_sequence_number,
-        self.sequence_number_to_entry,
-        txin.previous_output,
-      )? {
-        let offset = total_input_value + old_satpoint.offset;
+      let mut transferred_inscriptions = input_utxo_entries[input_index].parse_inscriptions();
+
+      transferred_inscriptions.sort_by_key(|(sequence_number, _)| *sequence_number);
+
+      for (sequence_number, old_satpoint_offset) in transferred_inscriptions {
+        let old_satpoint = SatPoint {
+          outpoint: txin.previous_output,
+          offset: old_satpoint_offset,
+        };
+
+        let inscription_id = InscriptionEntry::load(
+          self
+            .sequence_number_to_entry
+            .get(sequence_number)?
+            .unwrap()
+            .value(),
+        )
+        .id;
+
+        let offset = total_input_value + old_satpoint_offset;
         floating_inscriptions.push(Flotsam {
           offset,
           inscription_id,
-          origin: Origin::Old { old_satpoint },
+          origin: Origin::Old {
+            sequence_number,
+            old_satpoint,
+          },
         });
 
         inscribed_offsets
@@ -114,24 +132,8 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
 
       let offset = total_input_value;
 
-      // multi-level cache for UTXO set to get to the input amount
-      let txout = if let Some(txout) = self.utxo_cache.remove(&txin.previous_output) {
-        txout
-      } else if let Some(value) = self
-        .outpoint_to_txout
-        .remove(&txin.previous_output.store())?
-      {
-        TxOut::load(value.value())
-      } else {
-        self.txout_receiver.blocking_recv().map_err(|err| {
-          anyhow!(
-            "failed to get transaction for {}: {err}",
-            txin.previous_output.txid
-          )
-        })?
-      };
-
-      total_input_value += txout.value;
+      let input_value = input_utxo_entries[input_index].total_value();
+      total_input_value += input_value;
 
       // go through all inscriptions in this input
       while let Some(inscription) = envelopes.peek() {
@@ -194,29 +196,17 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
           .filter(|&pointer| pointer < total_output_value)
           .unwrap_or(offset);
 
-        let content_type = inscription.payload.content_type.as_deref();
-
-        let content_type_count = self
-          .content_type_to_count
-          .get(content_type)?
-          .map(|entry| entry.value())
-          .unwrap_or_default();
-
-        self
-          .content_type_to_count
-          .insert(content_type, content_type_count + 1)?;
-
         floating_inscriptions.push(Flotsam {
           inscription_id,
           offset,
           origin: Origin::New {
             cursed: curse.is_some() && !jubilant,
             fee: 0,
+            gallery: !inscription.payload.properties().gallery.is_empty(),
             hidden: inscription.payload.hidden(),
             parents: inscription.payload.parents(),
-            pointer: inscription.payload.pointer(),
             reinscription: inscribed_offsets.contains_key(&offset),
-            unbound: txout.value == 0
+            unbound: input_value == 0
               || curse == Some(Curse::UnrecognizedEvenField)
               || inscription.payload.unrecognized_even_field,
             vindicated: curse.is_some() && jubilant,
@@ -233,7 +223,7 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
       }
     }
 
-    if self.index_transactions && inscriptions {
+    if index.index_transactions && has_new_inscriptions {
       tx.consensus_encode(&mut self.transaction_buffer)
         .expect("in-memory writers don't error");
 
@@ -267,7 +257,7 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
     // still have to normalize over inscription size
     for flotsam in &mut floating_inscriptions {
       if let Flotsam {
-        origin: Origin::New { ref mut fee, .. },
+        origin: Origin::New { fee, .. },
         ..
       } = flotsam
       {
@@ -288,11 +278,10 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
     floating_inscriptions.sort_by_key(|flotsam| flotsam.offset);
     let mut inscriptions = floating_inscriptions.into_iter().peekable();
 
-    let mut range_to_vout = BTreeMap::new();
     let mut new_locations = Vec::new();
     let mut output_value = 0;
     for (vout, txout) in tx.output.iter().enumerate() {
-      let end = output_value + txout.value;
+      let end = output_value + txout.value.to_sat();
 
       while let Some(flotsam) = inscriptions.peek() {
         if flotsam.offset >= end {
@@ -314,44 +303,22 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
         ));
       }
 
-      range_to_vout.insert((output_value, end), vout.try_into().unwrap());
-
       output_value = end;
-
-      if !self.index_addresses {
-        self.utxo_cache.insert(
-          OutPoint {
-            vout: vout.try_into().unwrap(),
-            txid,
-          },
-          txout.clone(),
-        );
-      }
     }
 
-    for (new_satpoint, mut flotsam, op_return) in new_locations.into_iter() {
-      let new_satpoint = match flotsam.origin {
-        Origin::New {
-          pointer: Some(pointer),
-          ..
-        } if pointer < output_value => {
-          match range_to_vout.iter().find_map(|((start, end), vout)| {
-            (pointer >= *start && pointer < *end).then(|| (vout, pointer - start))
-          }) {
-            Some((vout, offset)) => {
-              flotsam.offset = pointer;
-              SatPoint {
-                outpoint: OutPoint { txid, vout: *vout },
-                offset,
-              }
-            }
-            _ => new_satpoint,
-          }
-        }
-        _ => new_satpoint,
-      };
+    for (new_satpoint, flotsam, op_return) in new_locations.into_iter() {
+      let output_utxo_entry =
+        &mut output_utxo_entries[usize::try_from(new_satpoint.outpoint.vout).unwrap()];
 
-      self.update_inscription_location(input_sat_ranges, flotsam, new_satpoint, op_return)?;
+      self.update_inscription_location(
+        input_sat_ranges,
+        flotsam,
+        new_satpoint,
+        op_return,
+        Some(output_utxo_entry),
+        utxo_cache,
+        index,
+      )?;
     }
 
     if is_coinbase {
@@ -360,7 +327,15 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
           outpoint: OutPoint::null(),
           offset: self.lost_sats + flotsam.offset - output_value,
         };
-        self.update_inscription_location(input_sat_ranges, flotsam, new_satpoint, false)?;
+        self.update_inscription_location(
+          input_sat_ranges,
+          flotsam,
+          new_satpoint,
+          false,
+          None,
+          utxo_cache,
+          index,
+        )?;
       }
       self.lost_sats += self.reward - output_value;
       Ok(())
@@ -374,14 +349,15 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
     }
   }
 
-  fn calculate_sat(
-    input_sat_ranges: Option<&VecDeque<(u64, u64)>>,
-    input_offset: u64,
-  ) -> Option<Sat> {
+  fn calculate_sat(input_sat_ranges: Option<&Vec<&[u8]>>, input_offset: u64) -> Option<Sat> {
     let input_sat_ranges = input_sat_ranges?;
 
     let mut offset = 0;
-    for (start, end) in input_sat_ranges {
+    for chunk in input_sat_ranges
+      .iter()
+      .flat_map(|slice| slice.as_chunks::<11>().0)
+    {
+      let (start, end) = SatRange::load(*chunk);
       let size = end - start;
       if offset + size > input_offset {
         let n = start + input_offset - offset;
@@ -395,24 +371,20 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
 
   fn update_inscription_location(
     &mut self,
-    input_sat_ranges: Option<&VecDeque<(u64, u64)>>,
+    input_sat_ranges: Option<&Vec<&[u8]>>,
     flotsam: Flotsam,
     new_satpoint: SatPoint,
     op_return: bool,
+    mut normal_output_utxo_entry: Option<&mut UtxoEntryBuf>,
+    utxo_cache: &mut HashMap<OutPoint, UtxoEntryBuf>,
+    index: &Index,
   ) -> Result {
     let inscription_id = flotsam.inscription_id;
     let (unbound, sequence_number) = match flotsam.origin {
-      Origin::Old { old_satpoint } => {
-        self
-          .satpoint_to_sequence_number
-          .remove_all(&old_satpoint.store())?;
-
-        let sequence_number = self
-          .id_to_sequence_number
-          .get(&inscription_id.store())?
-          .unwrap()
-          .value();
-
+      Origin::Old {
+        sequence_number,
+        old_satpoint,
+      } => {
         if op_return {
           let entry = InscriptionEntry::load(
             self
@@ -431,7 +403,7 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
           )?;
         }
 
-        if let Some(sender) = self.event_sender {
+        if let Some(ref sender) = index.event_sender {
           sender.blocking_send(Event::InscriptionTransferred {
             block_height: self.height,
             inscription_id,
@@ -446,9 +418,9 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
       Origin::New {
         cursed,
         fee,
+        gallery,
         hidden,
         parents,
-        pointer: _,
         reinscription,
         unbound,
         vindicated,
@@ -510,30 +482,64 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
           self.sat_to_sequence_number.insert(&n, &sequence_number)?;
         }
 
-        let parent_sequence_numbers = parents
-          .iter()
-          .map(|parent| {
-            let parent_sequence_number = self
-              .id_to_sequence_number
-              .get(&parent.store())?
+        let mut parent_inscription_ids = Vec::new();
+        let mut parent_sequence_numbers = Vec::new();
+
+        for parent in parents {
+          let Some(entry) = self.id_to_sequence_number.get(&parent.store())? else {
+            continue;
+          };
+
+          let parent_sequence_number = entry.value();
+
+          self
+            .sequence_number_to_children
+            .insert(parent_sequence_number, sequence_number)?;
+
+          let parent_hidden = InscriptionEntry::load(
+            self
+              .sequence_number_to_entry
+              .get(parent_sequence_number)?
               .unwrap()
-              .value();
+              .value(),
+          )
+          .hidden;
+
+          if !parent_hidden {
+            if let Some(old_latest) = self
+              .collection_to_latest_child
+              .get(parent_sequence_number)?
+              .map(|v| v.value())
+            {
+              self
+                .latest_child_to_collection
+                .remove(old_latest, parent_sequence_number)?;
+            }
 
             self
-              .sequence_number_to_children
+              .collection_to_latest_child
               .insert(parent_sequence_number, sequence_number)?;
 
-            Ok(parent_sequence_number)
-          })
-          .collect::<Result<Vec<u32>>>()?;
+            self
+              .latest_child_to_collection
+              .insert(sequence_number, parent_sequence_number)?;
+          }
 
-        if let Some(sender) = self.event_sender {
+          parent_inscription_ids.push(parent);
+          parent_sequence_numbers.push(parent_sequence_number);
+        }
+
+        if gallery && !hidden {
+          self.gallery_sequence_numbers.insert(sequence_number, ())?;
+        }
+
+        if let Some(ref sender) = index.event_sender {
           sender.blocking_send(Event::InscriptionCreated {
             block_height: self.height,
             charms,
             inscription_id,
             location: (!unbound).then_some(new_satpoint),
-            parent_inscription_ids: parents,
+            parent_inscription_ids,
             sequence_number,
           })?;
         }
@@ -544,6 +550,7 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
             charms,
             fee,
             height: self.height,
+            hidden,
             id: inscription_id,
             inscription_number,
             parents: parent_sequence_numbers,
@@ -580,17 +587,24 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
         offset: self.unbound_inscriptions,
       };
       self.unbound_inscriptions += 1;
-      new_unbound_satpoint.store()
+      normal_output_utxo_entry = None;
+      new_unbound_satpoint
     } else {
-      new_satpoint.store()
+      new_satpoint
     };
 
-    self
-      .satpoint_to_sequence_number
-      .insert(&satpoint, sequence_number)?;
-    self
-      .sequence_number_to_satpoint
-      .insert(sequence_number, &satpoint)?;
+    // The special outpoints, i.e., the null outpoint and the unbound outpoint,
+    // don't follow the normal rules. Unlike real outputs they get written to
+    // more than once. So we create a new UTXO entry here and commit() will
+    // merge it with any existing entry.
+    let output_utxo_entry = normal_output_utxo_entry.unwrap_or_else(|| {
+      assert!(Index::is_special_outpoint(satpoint.outpoint));
+      utxo_cache
+        .entry(satpoint.outpoint)
+        .or_insert(UtxoEntryBuf::empty(index))
+    });
+
+    output_utxo_entry.push_inscription(sequence_number, satpoint.offset, index);
 
     Ok(())
   }

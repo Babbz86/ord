@@ -2,10 +2,21 @@ use super::*;
 
 #[derive(Boilerplate)]
 pub(crate) struct SatHtml {
+  pub(crate) address: Option<Address>,
+  pub(crate) block: Option<BlockHeader>,
   pub(crate) blocktime: Blocktime,
   pub(crate) inscriptions: Vec<InscriptionId>,
   pub(crate) sat: Sat,
   pub(crate) satpoint: Option<SatPoint>,
+}
+
+impl SatHtml {
+  fn luck_odds(luck: u8) -> String {
+    match 1u128.checked_shl(luck.into()) {
+      Some(odds) => format!("1 in {odds}"),
+      None => format!("1 in 2^{luck}"),
+    }
+  }
 }
 
 impl PageContent for SatHtml {
@@ -19,9 +30,22 @@ mod tests {
   use super::*;
 
   #[test]
+  fn luck_odds() {
+    assert_eq!(SatHtml::luck_odds(0), "1 in 1");
+    assert_eq!(SatHtml::luck_odds(11), "1 in 2048");
+    assert_eq!(
+      SatHtml::luck_odds(127),
+      "1 in 170141183460469231731687303715884105728",
+    );
+    assert_eq!(SatHtml::luck_odds(128), "1 in 2^128");
+  }
+
+  #[test]
   fn first() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(0),
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -45,6 +69,7 @@ mod tests {
           <dd>
             <span title=coin>🪙</span>
             <span title=mythic>🎃</span>
+            <span title=palindrome>🦋</span>
           </dd>
         </dl>
         .*
@@ -60,6 +85,8 @@ mod tests {
   fn last() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(2099999997689999),
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -97,6 +124,8 @@ mod tests {
   fn sat_with_next_and_prev() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(1),
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -110,6 +139,8 @@ mod tests {
   fn sat_with_inscription() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(0),
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -131,6 +162,8 @@ mod tests {
   fn sat_with_reinscription() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(0),
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -153,6 +186,8 @@ mod tests {
   fn last_sat_next_link_is_disabled() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat::LAST,
         satpoint: None,
         blocktime: Blocktime::confirmed(0),
@@ -166,12 +201,44 @@ mod tests {
   fn sat_with_satpoint() {
     assert_regex_match!(
       SatHtml {
+        address: None,
+        block: None,
         sat: Sat(0),
         satpoint: Some(satpoint(1, 0)),
         blocktime: Blocktime::confirmed(0),
         inscriptions: Vec::new(),
       },
-      "<h1>Sat 0</h1>.*<dt>location</dt><dd class=monospace>1{64}:1:0</dd>.*",
+      "<h1>Sat 0</h1>.*<dt>location</dt><dd><a class=collapse href=/satpoint/1{64}:1:0>1{64}:1:0</a></dd>.*",
+    );
+  }
+
+  #[test]
+  fn sat_with_luck() {
+    assert_regex_match!(
+      SatHtml {
+        address: None,
+        block: Some(bitcoin::constants::genesis_block(Network::Bitcoin).header),
+        sat: Sat(0),
+        satpoint: None,
+        blocktime: Blocktime::confirmed(0),
+        inscriptions: Vec::new(),
+      },
+      "<h1>Sat 0</h1>.*<dt>luck</dt><dd><span title=\"1 in 2048\">11</span></dd>.*",
+    );
+  }
+
+  #[test]
+  fn sat_with_address() {
+    assert_regex_match!(
+      SatHtml {
+        address: Some(address(0)),
+        block: None,
+        sat: Sat(0),
+        satpoint: Some(satpoint(1, 0)),
+        blocktime: Blocktime::confirmed(0),
+        inscriptions: Vec::new(),
+      },
+      "<h1>Sat 0</h1>.*<dt>address</dt><dd class=monospace><a href=/address/bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4>bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4</a></dd>.*",
     );
   }
 }

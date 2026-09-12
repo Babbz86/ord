@@ -203,7 +203,7 @@ rpcport={bitcoind_port}
     }
 
     serde_json::to_writer_pretty(
-      fs::File::create(self.directory.join("env.json"))?,
+      File::create(self.directory.join("env.json"))?,
       &Info {
         bitcoind_port,
         ord_port,
@@ -241,10 +241,14 @@ bitcoin-cli -datadir={datadir} getblockchaininfo
 
     loop {
       if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
-        break Ok(None);
+        break;
       }
 
       thread::sleep(Duration::from_millis(100));
     }
+
+    thread::sleep(Duration::from_secs(5));
+
+    Ok(None)
   }
 }

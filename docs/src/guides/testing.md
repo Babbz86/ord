@@ -33,7 +33,7 @@ If `ord` is in the `$PATH` and the env directory is `env`, the `bitcoin-cli`
 command will be:
 
 ```
-bitcoin-cli -datadir=env`
+bitcoin-cli -datadir=env
 ```
 
 And the `ord` will be:
@@ -145,7 +145,7 @@ bitcoin-cli generatetoaddress 6 <receive address>
 
 To avoid having to change dependency inscription IDs to mainnet inscription IDs,
 you may utilize a content proxy when testing. `ord server` accepts a
-`--proxy` option, which takes the URL of a another `ord server`
+`--proxy` option, which takes the URL of another `ord server`
 instance. When making a request to `/content/<INSCRIPTION_ID>` when a content
 proxy is set and the inscription is not found, `ord server` will forward the
 request to the content proxy. This allows you to run a test `ord server`

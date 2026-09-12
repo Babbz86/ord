@@ -27,6 +27,12 @@ pub(crate) struct Inscribe {
   pub(crate) file: Option<PathBuf>,
   #[arg(
     long,
+    help = "Include <INSCRIPTION_ID> in gallery.",
+    value_name = "INSCRIPTION_ID"
+  )]
+  pub(crate) gallery: Vec<InscriptionId>,
+  #[arg(
+    long,
     help = "Include JSON in file at <METADATA> converted to CBOR as inscription metadata",
     conflicts_with = "cbor_metadata"
   )]
@@ -37,7 +43,8 @@ pub(crate) struct Inscribe {
   pub(crate) parent: Option<InscriptionId>,
   #[arg(
     long,
-    help = "Include <AMOUNT> postage with inscription. [default: 10000sat]"
+    help = "Include <AMOUNT> postage with inscription. [default: 10000sat]",
+    value_name = "AMOUNT"
   )]
   pub(crate) postage: Option<Amount>,
   #[clap(long, help = "Allow reinscription.")]
@@ -46,17 +53,29 @@ pub(crate) struct Inscribe {
   pub(crate) sat: Option<Sat>,
   #[arg(long, help = "Inscribe <SATPOINT>.", conflicts_with = "sat")]
   pub(crate) satpoint: Option<SatPoint>,
+  #[arg(long, help = "Set `title` property to <TITLE>.")]
+  pub(crate) title: Option<String>,
 }
 
 impl Inscribe {
   pub(crate) fn run(self, wallet: Wallet) -> SubcommandResult {
     let chain = wallet.chain();
 
-    if let Some(delegate) = self.delegate {
-      ensure! {
-        wallet.inscription_exists(delegate)?,
-        "delegate {delegate} does not exist"
-      }
+    let ids = self
+      .gallery
+      .iter()
+      .copied()
+      .chain(self.delegate)
+      .collect::<BTreeSet<InscriptionId>>()
+      .into_iter()
+      .collect::<Vec<InscriptionId>>();
+
+    let missing = wallet.missing_inscriptions(&ids)?;
+
+    ensure! {
+      missing.is_empty(),
+      "referenced inscriptions do not exist: {}",
+      missing.into_iter().map(|id| id.to_string()).collect::<Vec<String>>().join(", "),
     }
 
     batch::Plan {
@@ -71,17 +90,32 @@ impl Inscribe {
         chain,
         self.shared.compress,
         self.delegate,
-        Inscribe::parse_metadata(self.cbor_metadata, self.json_metadata)?,
+        WalletCommand::parse_metadata(self.cbor_metadata, self.json_metadata)?,
         self.metaprotocol,
         self.parent.into_iter().collect(),
         self.file,
         None,
+        Properties {
+          attributes: Attributes {
+            title: self.title,
+            traits: Traits::default(),
+          },
+          gallery: self
+            .gallery
+            .into_iter()
+            .map(|id| Item {
+              id: Some(id),
+              ..default()
+            })
+            .collect(),
+          txids: Vec::new(),
+        },
         None,
       )?],
       mode: batch::Mode::SeparateOutputs,
       no_backup: self.shared.no_backup,
       no_limit: self.shared.no_limit,
-      parent_info: wallet.get_parent_info(self.parent)?,
+      parent_info: wallet.get_parent_info(self.parent.as_slice())?,
       postages: vec![self.postage.unwrap_or(TARGET_POSTAGE)],
       reinscribe: self.reinscribe,
       reveal_fee_rate: self.shared.fee_rate,
@@ -94,29 +128,10 @@ impl Inscribe {
     }
     .inscribe(
       &wallet.locked_utxos().clone().into_keys().collect(),
-      wallet.get_runic_outputs()?,
+      wallet.get_runic_outputs()?.unwrap_or_default(),
       wallet.utxos(),
       &wallet,
     )
-  }
-
-  fn parse_metadata(cbor: Option<PathBuf>, json: Option<PathBuf>) -> Result<Option<Vec<u8>>> {
-    if let Some(path) = cbor {
-      let cbor = fs::read(path)?;
-      let _value: Value = ciborium::from_reader(Cursor::new(cbor.clone()))
-        .context("failed to parse CBOR metadata")?;
-
-      Ok(Some(cbor))
-    } else if let Some(path) = json {
-      let value: serde_json::Value =
-        serde_json::from_reader(fs::File::open(path)?).context("failed to parse JSON metadata")?;
-      let mut cbor = Vec::new();
-      ciborium::into_writer(&value, &mut cbor)?;
-
-      Ok(Some(cbor))
-    } else {
-      Ok(None)
-    }
   }
 }
 
@@ -174,39 +189,45 @@ mod tests {
       r".*required arguments.*--delegate <DELEGATE>\|--file <FILE>.*"
     );
 
-    assert!(Arguments::try_parse_from([
-      "ord",
-      "wallet",
-      "inscribe",
-      "--file",
-      "hello.txt",
-      "--fee-rate",
-      "1"
-    ])
-    .is_ok());
+    assert!(
+      Arguments::try_parse_from([
+        "ord",
+        "wallet",
+        "inscribe",
+        "--file",
+        "hello.txt",
+        "--fee-rate",
+        "1"
+      ])
+      .is_ok()
+    );
 
-    assert!(Arguments::try_parse_from([
-      "ord",
-      "wallet",
-      "inscribe",
-      "--delegate",
-      "038112028c55f3f77cc0b8b413df51f70675f66be443212da0642b7636f68a00i0",
-      "--fee-rate",
-      "1"
-    ])
-    .is_ok());
+    assert!(
+      Arguments::try_parse_from([
+        "ord",
+        "wallet",
+        "inscribe",
+        "--delegate",
+        "038112028c55f3f77cc0b8b413df51f70675f66be443212da0642b7636f68a00i0",
+        "--fee-rate",
+        "1"
+      ])
+      .is_ok()
+    );
 
-    assert!(Arguments::try_parse_from([
-      "ord",
-      "wallet",
-      "inscribe",
-      "--file",
-      "hello.txt",
-      "--delegate",
-      "038112028c55f3f77cc0b8b413df51f70675f66be443212da0642b7636f68a00i0",
-      "--fee-rate",
-      "1"
-    ])
-    .is_ok());
+    assert!(
+      Arguments::try_parse_from([
+        "ord",
+        "wallet",
+        "inscribe",
+        "--file",
+        "hello.txt",
+        "--delegate",
+        "038112028c55f3f77cc0b8b413df51f70675f66be443212da0642b7636f68a00i0",
+        "--fee-rate",
+        "1"
+      ])
+      .is_ok()
+    );
   }
 }
